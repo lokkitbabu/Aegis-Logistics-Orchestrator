@@ -1,391 +1,380 @@
 "use client";
 import { useEffect, useRef } from "react";
-import type { WorldState, Vec2 } from "@/lib/types";
+import type { WorldState, Vec2, SupplyNode, CargoType } from "@/lib/types";
+import { CARGO_COLOR } from "@/lib/types";
 
-// ── Geo projection: Nevada Test & Training Range (Tonopah area) ───────────────
 const GRID = 20;
-const SW: [number, number] = [-116.18, 37.08]; // [lng, lat]
-const NE: [number, number] = [-115.55, 37.58];
+const SW: [number,number] = [-116.18, 37.08];
+const NE: [number,number] = [-115.55, 37.58];
 
-function g2ll(x: number, y: number): [number, number] {
-  return [
-    SW[0] + (x / (GRID - 1)) * (NE[0] - SW[0]),
-    SW[1] + (y / (GRID - 1)) * (NE[1] - SW[1]),
-  ];
+export function g2ll(x: number, y: number): [number,number] {
+  return [SW[0]+(x/(GRID-1))*(NE[0]-SW[0]), SW[1]+(y/(GRID-1))*(NE[1]-SW[1])];
 }
 
-function cellPolygon(cx: number, cy: number): number[][] {
-  const dw = (NE[0] - SW[0]) / GRID;
-  const dh = (NE[1] - SW[1]) / GRID;
-  const [lng, lat] = g2ll(cx, cy);
-  return [
-    [lng - dw/2, lat - dh/2],
-    [lng + dw/2, lat - dh/2],
-    [lng + dw/2, lat + dh/2],
-    [lng - dw/2, lat + dh/2],
-    [lng - dw/2, lat - dh/2],
-  ];
+function cellPoly(cx: number, cy: number): number[][] {
+  const dw=(NE[0]-SW[0])/GRID, dh=(NE[1]-SW[1])/GRID;
+  const [lng,lat]=g2ll(cx,cy);
+  return [[lng-dw/2,lat-dh/2],[lng+dw/2,lat-dh/2],[lng+dw/2,lat+dh/2],[lng-dw/2,lat+dh/2],[lng-dw/2,lat-dh/2]];
 }
 
-const ASSET_COLORS: Record<string, string> = {
-  D1: "#00e5ff", D2: "#ff44aa", G1: "#00ff88",
+const ASSET_COLORS: Record<string,string> = { D1:"#00e5ff", D2:"#ff44aa", G1:"#00ff88" };
+
+const NODE_STYLES: Record<string, { color:string; shape:string; size:number }> = {
+  fob:     { color:"#00e5ff",  shape:"hexagon", size:22 },
+  depot:   { color:"#f0a500",  shape:"square",  size:18 },
+  outpost: { color:"#ff6644",  shape:"diamond", size:16 },
+  lz:      { color:"#88ff44",  shape:"circle",  size:14 },
 };
 
-const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
-
-function buildZoneGeoJSON(state: WorldState) {
-  const features: any[] = [];
-  for (const zone of state.zones) {
-    const color = zone.type === "no_go" ? "#ff3040" : zone.type === "threat" ? "#ff6600" : "#8844ff";
-    const opacity = zone.type === "no_go" ? 0.45 : 0.28;
-    features.push({
-      type: "Feature",
-      properties: { color, opacity, type: zone.type },
-      geometry: {
-        type: "MultiPolygon",
-        coordinates: [zone.cells.map(([x,y]) => [cellPolygon(x,y)])],
-      },
-    });
-  }
-  return { type: "FeatureCollection", features };
+function hexPath(cx: number, cy: number, r: number): string {
+  return Array.from({length:6},(_,i)=>{
+    const a = (i*60-30)*Math.PI/180;
+    return `${cx+r*Math.cos(a)},${cy+r*Math.sin(a)}`;
+  }).join(" ");
 }
 
-function buildGPSGeoJSON(state: WorldState) {
-  return {
-    type: "FeatureCollection",
-    features: state.gpsDenied.map(([x,y]) => ({
-      type: "Feature",
-      properties: {},
-      geometry: { type: "Polygon", coordinates: [cellPolygon(x,y)] },
-    })),
-  };
-}
+interface Props { state: WorldState; showRanges: boolean; }
 
-function buildRoutesGeoJSON(state: WorldState) {
-  return {
-    type: "FeatureCollection",
-    features: Object.values(state.assets)
-      .filter(a => a.route.length > 1 && a.routeIdx < a.route.length - 1)
-      .map(a => ({
-        type: "Feature",
-        properties: { color: ASSET_COLORS[a.id] ?? "#fff" },
-        geometry: {
-          type: "LineString",
-          coordinates: a.route.slice(a.routeIdx).map(([x,y]) => g2ll(x,y)),
-        },
-      })),
-  };
-}
-
-function buildTasksGeoJSON(state: WorldState) {
-  const features: any[] = [];
-  for (const task of Object.values(state.tasks)) {
-    const color = ({ pending:"#f0a500", assigned:"#00e5ff", in_progress:"#00e5ff", complete:"#00ff88", failed:"#ff3040" } as Record<string,string>)[task.status] ?? "#888";
-    features.push({
-      type: "Feature",
-      properties: { id: task.id, kind: "pickup", priority: task.priority, status: task.status, color },
-      geometry: { type: "Point", coordinates: g2ll(task.pickup[0], task.pickup[1]) },
-    });
-    features.push({
-      type: "Feature",
-      properties: { id: task.id, kind: "dropoff", priority: task.priority, status: task.status, color },
-      geometry: { type: "Point", coordinates: g2ll(task.dropoff[0], task.dropoff[1]) },
-    });
-  }
-  return { type: "FeatureCollection", features };
-}
-
-interface Props { state: WorldState }
-
-export default function MapView({ state }: Props) {
+export default function MapView({ state, showRanges }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
-  const markersRef = useRef<Record<string, any>>({});
   const initRef = useRef(false);
 
-  // Initialize map once
   useEffect(() => {
     if (initRef.current || !containerRef.current) return;
     initRef.current = true;
 
-    import("maplibre-gl").then(({ default: maplibregl }) => {
-      const center: [number, number] = [
-        (SW[0] + NE[0]) / 2,
-        (SW[1] + NE[1]) / 2,
-      ];
-
-      const map = new maplibregl.Map({
+    import("maplibre-gl").then(({ default: mgl }) => {
+      const center: [number,number] = [(SW[0]+NE[0])/2, (SW[1]+NE[1])/2];
+      const map = new mgl.Map({
         container: containerRef.current!,
         style: {
           version: 8,
+          glyphs: "https://fonts.openmaptiles.org/{fontstack}/{range}.pbf",
           sources: {
-            carto: {
+            esri: {
               type: "raster",
-              tiles: [
-                "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png",
-                "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png",
-                "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png",
-              ],
+              tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
               tileSize: 256,
-              attribution: "© CartoDB",
+              maxzoom: 18,
+              attribution: "© Esri",
+            },
+            labels: {
+              type: "raster",
+              tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"],
+              tileSize: 256,
             },
           },
-          layers: [{ id: "carto-tiles", type: "raster", source: "carto" }],
+          layers: [
+            { id:"satellite", type:"raster", source:"esri" },
+            { id:"labels",    type:"raster", source:"labels", paint:{"raster-opacity":0.4} },
+            // Dark tactical overlay
+            {
+              id: "dark-overlay",
+              type: "background",
+              paint: { "background-color": "rgba(4,10,16,0.45)" },
+            },
+          ],
         },
-        center,
-        zoom: 9.2,
-        bearing: 0,
-        pitch: 0,
-        attributionControl: false,
+        center, zoom: 9.0, bearing: 0, pitch: 0, attributionControl: false,
       });
-
       mapRef.current = map;
+      (map as any)._mgl = mgl;
 
       map.on("load", () => {
-        // GPS denied source/layer
-        map.addSource("gps-denied", { type: "geojson", data: buildGPSGeoJSON(state) as any });
-        map.addLayer({
-          id: "gps-denied-fill",
-          type: "fill",
-          source: "gps-denied",
-          paint: { "fill-color": "#8844ff", "fill-opacity": 0.18 },
-        });
-
-        // Zones source/layers
-        map.addSource("zones", { type: "geojson", data: buildZoneGeoJSON(state) as any });
-        map.addLayer({
-          id: "zones-fill",
-          type: "fill",
-          source: "zones",
-          paint: {
-            "fill-color": ["get", "color"],
-            "fill-opacity": ["get", "opacity"],
-          },
-        });
-        map.addLayer({
-          id: "zones-line",
-          type: "line",
-          source: "zones",
-          paint: {
-            "line-color": ["get", "color"],
-            "line-width": 1.5,
-            "line-opacity": 0.7,
-          },
-        });
-
         // AOR boundary
-        map.addSource("aor", {
-          type: "geojson",
-          data: {
-            type: "Feature" as const,
-            properties: {},
-            geometry: {
-              type: "Polygon" as const,
-              coordinates: [[
-                [SW[0]-0.02, SW[1]-0.02],
-                [NE[0]+0.02, SW[1]-0.02],
-                [NE[0]+0.02, NE[1]+0.02],
-                [SW[0]-0.02, NE[1]+0.02],
-                [SW[0]-0.02, SW[1]-0.02],
-              ]],
-            },
-          },
-        });
-        map.addLayer({
-          id: "aor-line",
-          type: "line",
-          source: "aor",
-          paint: {
-            "line-color": "rgba(0,229,255,0.35)",
-            "line-width": 1,
-            "line-dasharray": [8, 4],
-          },
-        });
+        map.addSource("aor", { type:"geojson", data: {
+          type:"Feature" as const, properties:{},
+          geometry:{ type:"Polygon" as const, coordinates:[[
+            [SW[0]-0.01,SW[1]-0.01],[NE[0]+0.01,SW[1]-0.01],
+            [NE[0]+0.01,NE[1]+0.01],[SW[0]-0.01,NE[1]+0.01],[SW[0]-0.01,SW[1]-0.01],
+          ]]},
+        }});
+        map.addLayer({ id:"aor-line", type:"line", source:"aor",
+          paint:{"line-color":"rgba(0,229,255,0.4)","line-width":1.5,"line-dasharray":[8,4]} });
 
-        // Tactical grid lines (every 5 cells)
-        const gridLines: number[][][] = [];
-        for (let i = 0; i <= GRID; i += 5) {
-          const [lng0] = g2ll(i, 0); const [, lat0] = g2ll(0, i);
-          gridLines.push([[lng0, SW[1]-0.05], [lng0, NE[1]+0.05]]);
-          gridLines.push([[SW[0]-0.05, lat0], [NE[0]+0.05, lat0]]);
+        // Tactical grid
+        const gridFeatures: any[] = [];
+        for (let i=0;i<=GRID;i+=5) {
+          const [lng]=g2ll(i,0); const [,lat]=g2ll(0,i);
+          gridFeatures.push({type:"Feature",properties:{},geometry:{type:"LineString",coordinates:[[lng,SW[1]-0.05],[lng,NE[1]+0.05]]}});
+          gridFeatures.push({type:"Feature",properties:{},geometry:{type:"LineString",coordinates:[[SW[0]-0.05,lat],[NE[0]+0.05,lat]]}});
         }
-        map.addSource("grid", {
-          type: "geojson",
-          data: {
-            type: "FeatureCollection",
-            features: gridLines.map(coords => ({
-              type: "Feature", properties: {},
-              geometry: { type: "LineString", coordinates: coords },
-            })),
-          },
-        });
-        map.addLayer({
-          id: "grid-lines",
-          type: "line",
-          source: "grid",
-          paint: { "line-color": "rgba(0,200,255,0.06)", "line-width": 0.5 },
-        });
+        map.addSource("grid",{type:"geojson",data:{type:"FeatureCollection",features:gridFeatures}});
+        map.addLayer({id:"grid-lines",type:"line",source:"grid",
+          paint:{"line-color":"rgba(0,200,255,0.07)","line-width":0.5}});
 
-        // Routes
-        map.addSource("routes", { type: "geojson", data: buildRoutesGeoJSON(state) as any });
-        map.addLayer({
-          id: "routes-line",
-          type: "line",
-          source: "routes",
-          paint: {
-            "line-color": ["get", "color"],
-            "line-width": 1.8,
-            "line-opacity": 0.65,
-            "line-dasharray": [6, 3],
-          },
-        });
+        // Zone fills
+        map.addSource("zones",{type:"geojson",data:buildZonesGJ(state) as any});
+        map.addLayer({id:"zones-fill",type:"fill",source:"zones",
+          paint:{"fill-color":["get","color"],"fill-opacity":["get","opacity"]}});
+        map.addLayer({id:"zones-line",type:"line",source:"zones",
+          paint:{"line-color":["get","lineColor"],"line-width":1.5,"line-opacity":0.8}});
 
-        // Task connector lines
-        map.addSource("task-connectors", {
-          type: "geojson",
-          data: {
-            type: "FeatureCollection" as const,
-            features: Object.values(state.tasks).map(t => ({
-              type: "Feature" as const,
-              properties: { color: ({ pending:"#f0a50044", assigned:"#00e5ff33", in_progress:"#00e5ff33", complete:"#00ff8833", failed:"#ff304433" } as Record<string,string>)[t.status] ?? "#88888833" },
-              geometry: {
-                type: "LineString",
-                coordinates: [g2ll(t.pickup[0],t.pickup[1]), g2ll(t.dropoff[0],t.dropoff[1])],
-              },
-            })),
-          },
-        });
-        map.addLayer({
-          id: "task-connectors-line",
-          type: "line",
-          source: "task-connectors",
-          paint: {
-            "line-color": ["get","color"],
-            "line-width": 1,
-            "line-dasharray": [4,4],
-          },
-        });
+        // GPS denied
+        map.addSource("gps",{type:"geojson",data:buildGpsGJ(state) as any});
+        map.addLayer({id:"gps-fill",type:"fill",source:"gps",
+          paint:{"fill-color":"rgba(136,68,255,0.18)","fill-pattern":undefined}});
 
-        // Task symbols
-        map.addSource("tasks", { type: "geojson", data: buildTasksGeoJSON(state) as any });
-        map.addLayer({
-          id: "tasks-circle",
-          type: "circle",
-          source: "tasks",
-          paint: {
-            "circle-radius": ["case", ["==", ["get","kind"],"pickup"], 6, 5],
-            "circle-color": ["get", "color"],
-            "circle-opacity": 0.85,
-            "circle-stroke-color": ["get","color"],
-            "circle-stroke-width": 1.5,
-            "circle-stroke-opacity": 1,
-          },
-        });
-        map.addLayer({
-          id: "tasks-label",
-          type: "symbol",
-          source: "tasks",
-          layout: {
-            "text-field": ["concat", ["get","id"], " ", ["case",["==",["get","kind"],"pickup"],"↓","★"]],
-            "text-font": ["Open Sans Regular"],
-            "text-size": 9,
-            "text-offset": [0, -1.2],
-            "text-anchor": "bottom",
-          },
-          paint: { "text-color": ["get","color"], "text-opacity": 0.85 },
-        });
+        // Route corridors (wide glow)
+        map.addSource("route-glow",{type:"geojson",data:buildRoutesGJ(state) as any});
+        map.addLayer({id:"route-glow-line",type:"line",source:"route-glow",
+          paint:{"line-color":["get","color"],"line-width":8,"line-opacity":0.08,"line-blur":4}});
+        map.addLayer({id:"route-line",type:"line",source:"route-glow",
+          paint:{"line-color":["get","color"],"line-width":1.8,"line-opacity":0.7,"line-dasharray":[5,3]}});
 
-        // Asset markers (custom HTML)
-        renderAssetMarkers(map, maplibregl, state);
+        // Task connectors
+        map.addSource("task-links",{type:"geojson",data:buildTaskLinksGJ(state) as any});
+        map.addLayer({id:"task-links-line",type:"line",source:"task-links",
+          paint:{"line-color":["get","color"],"line-width":1,"line-dasharray":[3,4],"line-opacity":0.4}});
 
-        // Store maplibregl ref for updates
-        (mapRef.current as any)._mgl = maplibregl;
+        // Task markers
+        map.addSource("tasks",{type:"geojson",data:buildTasksGJ(state) as any});
+        map.addLayer({id:"tasks-halo",type:"circle",source:"tasks",
+          paint:{"circle-radius":10,"circle-color":"transparent","circle-stroke-color":["get","color"],"circle-stroke-width":1.5,"circle-stroke-opacity":0.5}});
+        map.addLayer({id:"tasks-dot",type:"circle",source:"tasks",
+          paint:{"circle-radius":5,"circle-color":["get","color"],"circle-opacity":0.9}});
+
+        // Supply nodes (custom HTML markers)
+        renderNodeMarkers(map, mgl, state);
+
+        // Asset markers
+        renderAssetMarkers(map, mgl, state, showRanges);
       });
     });
 
     return () => {
-      Object.values(markersRef.current).forEach((m: any) => m.remove());
-      markersRef.current = {};
       mapRef.current?.remove();
       mapRef.current = null;
       initRef.current = false;
     };
   }, []); // eslint-disable-line
 
-  // Update sources when state changes
+  // Update on state change
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
-    const mgl = map._mgl;
-
+    if (!map?.isStyleLoaded()) return;
+    const mgl = (map as any)._mgl;
     try {
-      (map.getSource("zones") as any)?.setData(buildZoneGeoJSON(state));
-      (map.getSource("gps-denied") as any)?.setData(buildGPSGeoJSON(state));
-      (map.getSource("routes") as any)?.setData(buildRoutesGeoJSON(state));
-      (map.getSource("tasks") as any)?.setData(buildTasksGeoJSON(state));
-      (map.getSource("task-connectors") as any)?.setData({
-        type: "FeatureCollection",
-        features: Object.values(state.tasks).map(t => ({
-          type: "Feature",
-          properties: { color: ({ pending:"#f0a50044", assigned:"#00e5ff33", in_progress:"#00e5ff33", complete:"#00ff8833", failed:"#ff304433" } as Record<string,string>)[t.status] ?? "#88888833" },
-          geometry: {
-            type: "LineString",
-            coordinates: [g2ll(t.pickup[0],t.pickup[1]), g2ll(t.dropoff[0],t.dropoff[1])],
-          },
-        })),
-      });
+      (map.getSource("zones") as any)?.setData(buildZonesGJ(state));
+      (map.getSource("gps") as any)?.setData(buildGpsGJ(state));
+      (map.getSource("route-glow") as any)?.setData(buildRoutesGJ(state));
+      (map.getSource("task-links") as any)?.setData(buildTaskLinksGJ(state));
+      (map.getSource("tasks") as any)?.setData(buildTasksGJ(state));
+      if (mgl) {
+        renderNodeMarkers(map, mgl, state);
+        renderAssetMarkers(map, mgl, state, showRanges);
+      }
+    } catch {}
+  }, [state, showRanges]);
 
-      if (mgl) renderAssetMarkers(map, mgl, state);
-    } catch { /* map may not be ready */ }
-  }, [state]);
-
-  return (
-    <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
-  );
+  return <div ref={containerRef} style={{width:"100%",height:"100%"}} />;
 }
 
-function renderAssetMarkers(map: any, mgl: any, state: WorldState) {
-  // We use a global registry on the map object
-  if (!map._assetMarkers) map._assetMarkers = {};
-  const markers = map._assetMarkers as Record<string, any>;
+// ── GeoJSON builders ──────────────────────────────────────────────────────────
 
-  for (const asset of Object.values(state.assets)) {
-    const color = ASSET_COLORS[asset.id] ?? "#fff";
-    const [lng, lat] = g2ll(asset.pos[0], asset.pos[1]);
+function buildZonesGJ(state: WorldState) {
+  return {
+    type:"FeatureCollection",
+    features: state.zones.map(z => ({
+      type:"Feature",
+      properties: {
+        color: z.type==="no_go"?"rgba(255,48,64,0.55)":z.type==="threat"?"rgba(255,102,0,0.35)":"rgba(136,68,255,0.25)",
+        opacity: z.type==="no_go"?0.55:0.35,
+        lineColor: z.type==="no_go"?"#ff3040":z.type==="threat"?"#ff6600":"#8844ff",
+      },
+      geometry:{ type:"MultiPolygon", coordinates:[z.cells.map(([x,y])=>[cellPoly(x,y)])] },
+    })),
+  };
+}
 
-    if (markers[asset.id]) {
-      markers[asset.id].setLngLat([lng, lat]);
-      // Update battery bar
-      const bar = document.getElementById(`batt-${asset.id}`);
-      if (bar) {
-        const pct = asset.battery;
-        const bc = pct > 40 ? "#00ff88" : pct > 15 ? "#f0a500" : "#ff3040";
-        bar.style.width = `${pct}%`;
-        bar.style.background = bc;
+function buildGpsGJ(state: WorldState) {
+  return {
+    type:"FeatureCollection",
+    features: state.gpsDenied.map(([x,y])=>({
+      type:"Feature", properties:{},
+      geometry:{type:"Polygon",coordinates:[cellPoly(x,y)]},
+    })),
+  };
+}
+
+function buildRoutesGJ(state: WorldState) {
+  return {
+    type:"FeatureCollection",
+    features: Object.values(state.assets)
+      .filter(a=>a.route.length>1 && a.routeIdx<a.route.length-1)
+      .map(a=>({
+        type:"Feature",
+        properties:{ color: ASSET_COLORS[a.id]??"#fff" },
+        geometry:{ type:"LineString", coordinates:a.route.slice(a.routeIdx).map(([x,y])=>g2ll(x,y)) },
+      })),
+  };
+}
+
+function buildTaskLinksGJ(state: WorldState) {
+  return {
+    type:"FeatureCollection",
+    features: Object.values(state.tasks)
+      .filter(t=>!["complete","cancelled"].includes(t.status))
+      .map(t=>({
+        type:"Feature",
+        properties:{ color: t.status==="pending"?"rgba(240,165,0,0.5)":t.status==="approved"?"rgba(0,229,255,0.4)":"rgba(0,255,136,0.4)" },
+        geometry:{ type:"LineString", coordinates:[g2ll(t.pickup[0],t.pickup[1]),g2ll(t.dropoff[0],t.dropoff[1])] },
+      })),
+  };
+}
+
+function buildTasksGJ(state: WorldState) {
+  const colorOf = (status: string) => ({pending:"#f0a500",approved:"#00e5ff",assigned:"#00e5ff",in_progress:"#44aaff",complete:"#00ff88",failed:"#ff3040",cancelled:"#444"} as Record<string,string>)[status]??"#888";
+  return {
+    type:"FeatureCollection",
+    features: Object.values(state.tasks).flatMap(t=>[
+      { type:"Feature", properties:{color:colorOf(t.status),kind:"pickup",id:t.id},
+        geometry:{type:"Point",coordinates:g2ll(t.pickup[0],t.pickup[1])} },
+      { type:"Feature", properties:{color:colorOf(t.status),kind:"dropoff",id:t.id},
+        geometry:{type:"Point",coordinates:g2ll(t.dropoff[0],t.dropoff[1])} },
+    ]),
+  };
+}
+
+// ── Marker renderers ──────────────────────────────────────────────────────────
+
+function renderNodeMarkers(map: any, mgl: any, state: WorldState) {
+  if (!map._nodeMarkers) map._nodeMarkers = {};
+  const markers = map._nodeMarkers as Record<string,any>;
+
+  for (const node of Object.values(state.nodes)) {
+    const style = NODE_STYLES[node.type] ?? NODE_STYLES.outpost;
+    const [lng, lat] = g2ll(node.pos[0], node.pos[1]);
+
+    const cargoItems = Object.entries(node.inventory) as [CargoType, number][];
+    const criticals = cargoItems.filter(([c,v]) => v/node.capacity[c] < node.criticalThreshold);
+
+    if (markers[node.id]) {
+      markers[node.id].setLngLat([lng, lat]);
+      // update inventory bars
+      for (const [c] of cargoItems) {
+        const bar = document.getElementById(`inv-${node.id}-${c}`);
+        if (bar) {
+          const pct = (node.inventory[c]/node.capacity[c])*100;
+          bar.style.width = `${pct}%`;
+          bar.style.background = pct<30?"#ff3040":pct<60?"#f0a500":CARGO_COLOR[c];
+        }
       }
-      const statusEl = document.getElementById(`status-${asset.id}`);
-      if (statusEl) statusEl.textContent = asset.status.toUpperCase();
-      // Update ring glow on active
-      const ring = document.getElementById(`ring-${asset.id}`);
-      if (ring) ring.style.boxShadow = asset.currentTask ? `0 0 12px ${color}66` : "none";
+      // alert badge
+      const badge = document.getElementById(`badge-${node.id}`);
+      if (badge) badge.style.display = criticals.length>0?"block":"none";
     } else {
       const el = document.createElement("div");
-      el.className = "asset-marker";
-      el.style.color = color;
-      el.innerHTML = `
-        <div class="asset-label">${asset.id} · ${asset.type.toUpperCase()}</div>
-        <div class="asset-ring" id="ring-${asset.id}" style="border-color:${color};color:${color}">
-          <div class="pulse-ring" style="border-color:${color}66"></div>
-          ${asset.type === "drone" ? "✦" : "◈"}
-        </div>
-        <div id="status-${asset.id}" class="asset-status">${asset.status.toUpperCase()}</div>
-        <div style="position:absolute;bottom:-22px;left:50%;transform:translateX(-50%);width:32px;height:2px;background:#1a2a2a;border-radius:1px">
-          <div id="batt-${asset.id}" style="height:100%;width:${asset.battery}%;background:${asset.battery>40?"#00ff88":asset.battery>15?"#f0a500":"#ff3040"};border-radius:1px;transition:width 0.3s"></div>
-        </div>
-      `;
-      markers[asset.id] = new mgl.Marker({ element: el, anchor: "center" })
-        .setLngLat([lng, lat])
-        .addTo(map);
+      el.style.cssText = `font-family:'Share Tech Mono',monospace;color:${style.color};cursor:pointer;`;
+      el.innerHTML = buildNodeHTML(node, style, cargoItems, criticals.length>0);
+      markers[node.id] = new mgl.Marker({ element:el, anchor:"center" })
+        .setLngLat([lng, lat]).addTo(map);
     }
   }
+}
+
+function buildNodeHTML(node: SupplyNode, style: {color:string;shape:string;size:number},
+  cargoItems: [CargoType,number][], hasAlert: boolean): string {
+  const s = style.size;
+  const shapeEl = style.shape==="hexagon"
+    ? `<svg width="${s*2}" height="${s*2}" viewBox="-${s} -${s} ${s*2} ${s*2}"><polygon points="${hexPath(0,0,s-2)}" fill="rgba(0,0,0,0.7)" stroke="${style.color}" stroke-width="1.5"/><text x="0" y="4" text-anchor="middle" fill="${style.color}" font-size="8" font-family="Share Tech Mono">${node.type.substring(0,3).toUpperCase()}</text></svg>`
+    : style.shape==="square"
+    ? `<svg width="${s*2}" height="${s*2}" viewBox="0 0 ${s*2} ${s*2}"><rect x="2" y="2" width="${s*2-4}" height="${s*2-4}" fill="rgba(0,0,0,0.7)" stroke="${style.color}" stroke-width="1.5"/><text x="${s}" y="${s+3}" text-anchor="middle" fill="${style.color}" font-size="7" font-family="Share Tech Mono">DEP</text></svg>`
+    : `<svg width="${s*2}" height="${s*2}" viewBox="-${s} -${s} ${s*2} ${s*2}"><polygon points="0,-${s-2} ${s-2},0 0,${s-2} -${s-2},0" fill="rgba(0,0,0,0.7)" stroke="${style.color}" stroke-width="1.5"/></svg>`;
+
+  const invBars = cargoItems.map(([c,v])=>{
+    const pct = (v/100)*100;
+    const bc = pct<30?"#ff3040":pct<60?"#f0a500":CARGO_COLOR[c];
+    return `<div style="display:flex;align-items:center;gap:3px;margin-bottom:1px">
+      <span style="color:${CARGO_COLOR[c]};font-size:7px;width:14px">${c.substring(0,3).toUpperCase()}</span>
+      <div style="flex:1;height:3px;background:#1a2a1a;border-radius:1px">
+        <div id="inv-${node.id}-${c}" style="height:100%;width:${pct}%;background:${bc};border-radius:1px;transition:width 0.5s"></div>
+      </div>
+      <span style="color:${bc};font-size:7px;width:22px;text-align:right">${Math.round(v)}%</span>
+    </div>`;
+  }).join("");
+
+  return `
+    <div style="position:relative">
+      ${hasAlert?`<div id="badge-${node.id}" style="position:absolute;top:-6px;right:-6px;width:8px;height:8px;background:#ff3040;border-radius:50%;box-shadow:0 0 6px #ff3040;z-index:10;animation:pulse-ring 1s ease-out infinite"></div>`
+                :`<div id="badge-${node.id}" style="display:none"></div>`}
+      <div style="text-align:center;margin-bottom:2px">${shapeEl}</div>
+      <div style="font-size:8px;color:${style.color};text-align:center;letter-spacing:0.1em;margin-bottom:3px;white-space:nowrap">${node.name}</div>
+      <div style="width:90px;background:rgba(0,0,0,0.75);border:1px solid rgba(255,255,255,0.08);padding:4px;border-radius:2px">
+        ${invBars}
+      </div>
+    </div>
+  `;
+}
+
+function renderAssetMarkers(map: any, mgl: any, state: WorldState, showRanges: boolean) {
+  if (!map._assetMarkers) map._assetMarkers = {};
+  const markers = map._assetMarkers as Record<string,any>;
+  // Range rings
+  if (!map._rangeSource) {
+    map.addSource("ranges",{type:"geojson",data:{type:"FeatureCollection",features:[]}});
+    map.addLayer({id:"ranges-fill",type:"fill",source:"ranges",
+      paint:{"fill-color":["get","color"],"fill-opacity":0.04}});
+    map.addLayer({id:"ranges-line",type:"line",source:"ranges",
+      paint:{"line-color":["get","color"],"line-width":1,"line-opacity":0.3,"line-dasharray":[4,4]}});
+    map.addLayer({id:"heading-line",type:"line",source:"ranges",
+      filter:["==",["get","kind"],"heading"],
+      paint:{"line-color":["get","color"],"line-width":2,"line-opacity":0.6}});
+    map._rangeSource = true;
+  }
+
+  const rangeFeatures: any[] = [];
+  for (const asset of Object.values(state.assets)) {
+    const color = ASSET_COLORS[asset.id]??"#fff";
+    const [lng,lat] = g2ll(asset.pos[0], asset.pos[1]);
+
+    if (showRanges) {
+      const rangeCells = asset.battery / (asset.type==="drone"?1.2:0.6) * 0.4;
+      const dLng = (NE[0]-SW[0])/(GRID-1) * rangeCells;
+      const dLat = (NE[1]-SW[1])/(GRID-1) * rangeCells;
+      const pts: [number,number][] = [];
+      for (let a=0;a<=360;a+=10) pts.push([lng+dLng*Math.cos(a*Math.PI/180), lat+dLat*Math.sin(a*Math.PI/180)]);
+      pts.push(pts[0]);
+      rangeFeatures.push({type:"Feature",properties:{color,kind:"range"},
+        geometry:{type:"Polygon",coordinates:[pts]}});
+    }
+
+    // Heading arrow
+    if (asset.route.length>1 && asset.routeIdx<asset.route.length-1) {
+      const next = asset.route[asset.routeIdx+1];
+      const [nlng,nlat]=g2ll(next[0],next[1]);
+      rangeFeatures.push({type:"Feature",properties:{color,kind:"heading"},
+        geometry:{type:"LineString",coordinates:[[lng,lat],[nlng,nlat]]}});
+    }
+
+    if (markers[asset.id]) {
+      markers[asset.id].setLngLat([lng,lat]);
+      const bar = document.getElementById(`ab-${asset.id}`);
+      if (bar) { const bc=asset.battery>40?"#00ff88":asset.battery>15?"#f0a500":"#ff3040"; bar.style.width=`${asset.battery}%`; bar.style.background=bc; }
+      const stEl = document.getElementById(`ast-${asset.id}`);
+      if (stEl) stEl.textContent=asset.status.toUpperCase();
+      const cargoEl = document.getElementById(`ac-${asset.id}`);
+      if (cargoEl) cargoEl.textContent=asset.cargo.length?asset.cargo.map(c=>`${c.quantity}×${c.type.substring(0,3).toUpperCase()}`).join(" "):"EMPTY";
+    } else {
+      const el = document.createElement("div");
+      el.style.cssText = `font-family:'Share Tech Mono',monospace;color:${color}`;
+      const bc = asset.battery>40?"#00ff88":asset.battery>15?"#f0a500":"#ff3040";
+      el.innerHTML = `
+        <div style="position:relative;text-align:center">
+          <div style="font-size:8px;color:${color};letter-spacing:0.1em;margin-bottom:2px">${asset.id}</div>
+          <div style="width:36px;height:36px;border-radius:50%;border:1.5px solid ${color};background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;font-size:14px;box-shadow:0 0 12px ${color}44;position:relative">
+            <div style="position:absolute;inset:-5px;border-radius:50%;border:1px solid ${color}33"></div>
+            ${asset.type==="drone"?"✦":"◈"}
+          </div>
+          <div id="ast-${asset.id}" style="font-size:7px;color:${color}88;margin-top:2px;letter-spacing:0.08em">${asset.status.toUpperCase()}</div>
+          <div id="ac-${asset.id}" style="font-size:7px;color:#888;white-space:nowrap">${asset.cargo.length?asset.cargo.map(c=>`${c.quantity}×${c.type.substring(0,3).toUpperCase()}`).join(" "):"EMPTY"}</div>
+          <div style="width:36px;height:2px;background:#1a2a1a;margin:2px 0;border-radius:1px">
+            <div id="ab-${asset.id}" style="height:100%;width:${asset.battery}%;background:${bc};border-radius:1px;transition:width 0.4s"></div>
+          </div>
+        </div>`;
+      markers[asset.id] = new mgl.Marker({element:el,anchor:"center"}).setLngLat([lng,lat]).addTo(map);
+    }
+  }
+  try { (map.getSource("ranges") as any)?.setData({type:"FeatureCollection",features:rangeFeatures}); } catch {}
 }
