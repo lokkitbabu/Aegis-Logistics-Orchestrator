@@ -9,6 +9,9 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@osdk/client": "^2.9.0",
+    "@osdk/foundry": "^2.59.0",
+    "@osdk/oauth": "^0.3.2",
     "@types/maplibre-gl": "^1.13.2",
     "lucide-react": "^1.8.0",
     "maplibre-gl": "^5.23.0",

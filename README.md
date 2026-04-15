@@ -1,36 +1,145 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AEGIS — Critical Infrastructure Response Coordinator
+
+A county-level disaster operations platform for Georgia emergency management (FEMA/National Guard). Integrates live public hazard, disaster, demographic, and hospital data into an operational Foundry-style model, then uses AI to help emergency managers prioritize and assign response actions.
+
+## What It Does
+
+**Four live data sources, no mocks:**
+- **NWS** `api.weather.gov/alerts/active?area=GA` — live weather alerts, auto-refreshed every 2 minutes
+- **OpenFEMA** `fema.gov/api/open/v2/disasterDeclarations` — disaster declarations (5-year window)
+- **Census ACS** `api.census.gov/data/2022/acs5` — population, elderly %, no-vehicle households, poverty rates for all 159 Georgia counties
+- **HIFLD** `services1.arcgis.com/Hp6G80Pky0om7QvQ` — hospital locations and bed counts
+
+**Operational decision engine:**
+- Risk scoring: composite of weather severity, FEMA declaration status, population exposure, vulnerability, hospital density
+- Auto task generation: 5 rule types (damage assessment, facility check, shelter support, resource staging, evacuation)
+- Resource assignment: priority-weighted greedy matching with type compatibility
+- Shortfall analysis: identifies uncovered high-priority tasks and what resource types are needed
+
+**AIP Copilot:**
+- Situation synthesis — named counties, quantified risk factors
+- Action recommendations — specific crew/generator/shelter deployments
+- Explain decisions — cite data (alert type, declaration, hospital count, vulnerability %)
+- Operator overrides — natural language → weight adjustments → live recompute
+
+**Foundry Platform SDK:**
+- `@osdk/foundry` v2.59.0 installed — `OntologyObjectsV2.list()`, `Actions.apply()`, `AipAgents.Sessions.blockingContinue()`
+- When `FOUNDRY_STACK` is configured, task approvals/cancellations write back to the Foundry Ontology
+- Falls back gracefully to in-memory state when running standalone
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
+git clone https://github.com/lokkitbabu/Aegis-Logistics-Orchestrator
+cd Aegis-Logistics-Orchestrator
+npm install
+cp .env.local.example .env.local   # fill in API keys
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+# → http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Environment Variables
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+# Required for AI copilot (choose one):
+ANTHROPIC_API_KEY=sk-ant-...        # Claude via Anthropic API
+AIP_TOKEN=...                        # Palantir AIP REST endpoint token
+AIP_ENDPOINT=https://...             # Palantir AIP REST endpoint URL
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+# Optional — Foundry Platform SDK (real Ontology writeback):
+FOUNDRY_STACK=https://your-stack.palantirfoundry.com
+FOUNDRY_CLIENT_ID=...                # OAuth2 client ID from Developer Console
+FOUNDRY_CLIENT_SECRET=...            # OAuth2 client secret
+FOUNDRY_ONTOLOGY_RID=ri.ontology.main.ontology.xxxxx
+FOUNDRY_AIP_AGENT_RID=ri.aip-agents.main.agent.xxxxx   # optional
+```
 
-## Learn More
+## Foundry Integration
 
-To learn more about Next.js, take a look at the following resources:
+### Ontology Object Types
+| Object Type | Properties | Backed By |
+|-------------|-----------|-----------|
+| `county-region` | fips, name, riskScore, alertLevel, vulnerabilityScore, population | Census ACS + NWS + FEMA |
+| `hazard-event` | eventId, type, severity, issuedAt, expiresAt, affectedCountyFips | NWS Alerts |
+| `critical-facility` | name, countyFips, beds, type, lat, lng | HIFLD |
+| `response-task` | taskId, type, priorityScore, status, assignedResourceId | Generated |
+| `response-resource` | resourceId, type, label, status, assignedTaskId | Configured |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Action Types
+| Action | Parameters | Effect |
+|--------|-----------|--------|
+| `approve-response-task` | `taskId` | → `in_progress`, triggers assignment |
+| `cancel-response-task` | `taskId` | → `cancelled`, releases resource |
+| `assign-resource-to-task` | `taskId`, `resourceId` | Deploys resource |
+| `apply-scoring-weights` | `weatherSeverity`, etc. | Recomputes all risk scores |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### SDK Usage
+```typescript
+import { Ontologies, AipAgents } from "@osdk/foundry";
+import { createPlatformClient } from "@osdk/client";
+import { createConfidentialOauthClient } from "@osdk/oauth";
 
-## Deploy on Vercel
+const auth = createConfidentialOauthClient(clientId, secret, stack);
+const client = createPlatformClient(stack, auth);
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+// Read county risk data
+const counties = await Ontologies.OntologyObjectsV2.list(
+  client, ontologyRid, "county-region",
+  { select: ["countyFips", "riskScore", "alertLevel"],
+    orderBy: { fields: [{ field: "riskScore", direction: "DESC" }] } }
+);
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+// Apply task approval action
+await Ontologies.Actions.apply(client, ontologyRid,
+  "approve-response-task", { parameters: { taskId: "T001" } }
+);
+
+// AIP Agent session
+const session = await AipAgents.Sessions.create(client, agentRid, {});
+const response = await AipAgents.Sessions.blockingContinue(
+  client, agentRid, session.rid,
+  { userInput: { text: "Synthesize current situation" }, parameterInputs: {} }
+);
+```
+
+## Architecture
+
+```
+NWS Alerts ──────┐
+OpenFEMA ────────┤ /api/nws, /api/fema,     ┌─ Risk Scoring Engine
+Census ACS ──────┤ /api/census, /api/hospitals├─ Task Generation Rules  → SystemState
+HIFLD Hospitals ─┘                           └─ Assignment Planner
+                                                        │
+                              Foundry Platform SDK ─────┤ (optional writeback)
+                              OntologyObjectsV2.list()   │
+                              Actions.apply()            │
+                              AipAgents.Sessions.blockingContinue()
+                                                        │
+                         AIP Copilot → /api/aip ────────┤
+                         (Foundry AIP Agent priority)    │
+                                                        ▼
+                                              Operator Dashboard
+                                         County Choropleth Map
+                                         Task Queue + Approvals
+                                         Resource Deployment
+                                         Incident Report Export
+```
+
+## Demo Scenarios
+
+Four pre-built simulation scenarios (no live alerts needed):
+- **Coastal Flooding** — Chatham, Bryan, Glynn, Camden (storm surge)
+- **Tornado Outbreak** — Fulton, DeKalb, Clayton (metro Atlanta)
+- **Inland Flooding** — Lowndes, Thomas, Brooks (south Georgia)
+- **Ice Storm** — Cherokee, Pickens, Gilmer (north Georgia mountains)
+
+Click any scenario in the left panel to inject realistic NWS-style alerts and watch the system recompute risk scores, generate tasks, and assign resources.
+
+## Report Export
+
+Click **⬇ REPORT** in the top bar to download a structured HTML incident report including:
+- Top 10 counties by risk score
+- All active response tasks with assignments
+- Resource deployment status
+- Active NWS alerts summary
+- Resource shortfall analysis

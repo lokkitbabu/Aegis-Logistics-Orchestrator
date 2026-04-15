@@ -1,51 +1,97 @@
+/**
+ * POST /api/aip
+ *
+ * Unified AIP endpoint. Priority:
+ *   1. Foundry AIP Agent (if FOUNDRY_AIP_AGENT_RID configured)
+ *      → AipAgents.Sessions.blockingContinue() — agent reasons over live Ontology
+ *   2. Anthropic claude-sonnet (if ANTHROPIC_API_KEY configured)
+ *      → Raw LLM with injected operational context
+ *   3. Palantir AIP REST endpoint (if AIP_ENDPOINT + AIP_TOKEN configured)
+ */
 import { NextRequest, NextResponse } from "next/server";
+import { getFoundryConfig } from "@/lib/foundry-client";
 
-const SYSTEM = `You are an AI advisor embedded in a Critical Infrastructure Response Coordinator for Georgia emergency management (FEMA/National Guard operations).
+const SYSTEM = `You are an AI operations advisor embedded in AEGIS — a Critical Infrastructure Response Coordinator for Georgia emergency management (FEMA/National Guard).
 
-You analyze real county-level data: NWS weather alerts, FEMA disaster declarations, Census vulnerability data (elderly, no-vehicle, poverty), and hospital locations.
+You have access to live county-level data: NWS weather alerts, FEMA disaster declarations, Census vulnerability data (elderly %, no-vehicle households, poverty rate), and HIFLD hospital locations across all 159 Georgia counties.
 
 Respond ONLY in raw JSON. No markdown. No preamble.
 
-For SITUATION SYNTHESIS: {"action":"situation_synthesis","message":"<2-3 sentence operational summary naming specific counties and why>"}
+RESPONSE SCHEMAS:
 
-For RECOMMEND ACTIONS: {"action":"recommend_actions","message":"<specific actionable recommendations with county names and resource types>"}
+Situation synthesis:
+{"action":"situation_synthesis","message":"<2-3 sentences naming specific counties and quantified risk factors>"}
 
-For EXPLAIN DECISION: {"action":"explain_decision","message":"<explain why a specific county ranks high or task was created, citing data points>"}
+Action recommendations:
+{"action":"recommend_actions","message":"<specific actionable steps with county names and resource types>"}
 
-For OPERATOR OVERRIDE (e.g. 'prioritize hospitals', 'focus on coastal counties'):
+Explain decision:
+{"action":"explain_decision","message":"<explain ranking citing specific data: alert type, declaration status, hospital count, vulnerability score>"}
+
+Operator override (prioritize hospitals, focus coastal, reassign resources, etc.):
 {"action":"apply_override","message":"<what changed and why>","weightOverrides":{"weatherSeverity":<0-1>,"femaDeclaration":<0-1>,"populationExposure":<0-1>,"vulnerability":<0-1>,"criticalFacility":<0-1>}}
 
-For RESOURCE ANALYSIS: {"action":"resource_analysis","message":"<analysis of coverage gaps, shortfalls, and recommendations>"}
+Resource gap analysis:
+{"action":"resource_analysis","message":"<coverage gaps, uncovered tasks, what resources are needed and where>"}
 
-Always cite specific county names, risk scores, and data sources. Never be generic.`;
+Rules:
+- Always cite specific county names (e.g. Fulton, Chatham, Lowndes)
+- Always reference specific data points (risk score %, alert type, hospital count)
+- Weights must sum to approximately 1.0
+- Never be generic — this is a real ops system with real data`;
 
 export async function POST(req: NextRequest) {
-  const { message, context } = await req.json();
-  const apiKey = process.env.ANTHROPIC_API_KEY || process.env.AIP_TOKEN;
-  const endpoint = process.env.AIP_ENDPOINT || "https://api.anthropic.com/v1/messages";
-  const usePalantir = !!process.env.AIP_ENDPOINT;
+  const { message, context, sessionRid } = await req.json();
 
-  if (!apiKey) return NextResponse.json({ action:"situation_synthesis", message:"AIP not configured. Set ANTHROPIC_API_KEY or AIP_TOKEN." });
+  // ── Priority 1: Foundry AIP Agent ────────────────────────────────────────
+  const foundryConfig = getFoundryConfig();
+  if (foundryConfig?.aipAgentRid) {
+    try {
+      const res = await fetch(`${process.env.NEXTAUTH_URL ?? "http://localhost:3000"}/api/foundry/aip-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, sessionRid, context }),
+      });
+      const data = await res.json();
+      if (data.configured && data.message) return NextResponse.json(data);
+    } catch {}
+  }
+
+  // ── Priority 2: Palantir AIP REST endpoint ────────────────────────────────
+  const aipEndpoint = process.env.AIP_ENDPOINT;
+  const aipToken    = process.env.AIP_TOKEN;
+  if (aipEndpoint && aipToken) {
+    try {
+      const res = await fetch(aipEndpoint, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${aipToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ userInput: { message }, context: { systemState: context } }),
+      });
+      const data = await res.json();
+      const text = (data?.response?.message ?? "{}").replace(/```json|```/g, "").trim();
+      return NextResponse.json({ source: "palantir_aip", ...JSON.parse(text) });
+    } catch {}
+  }
+
+  // ── Priority 3: Anthropic API ─────────────────────────────────────────────
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return NextResponse.json({ action: "situation_synthesis", message: "No AI backend configured. Set ANTHROPIC_API_KEY, AIP_TOKEN, or FOUNDRY_AIP_AGENT_RID.", source: "none" });
+  }
 
   try {
-    const headers: Record<string,string> = {"Content-Type":"application/json"};
-    let body: object;
-    if (usePalantir) {
-      headers["Authorization"] = `Bearer ${apiKey}`;
-      body = { userInput:{message}, context:{systemState:context} };
-    } else {
-      headers["x-api-key"] = apiKey;
-      headers["anthropic-version"] = "2023-06-01";
-      body = {
-        model:"claude-sonnet-4-20250514", max_tokens:600, system:SYSTEM,
-        messages:[{role:"user",content:`LIVE SYSTEM STATE:\n${JSON.stringify(context,null,2)}\n\nOPERATOR: ${message}`}],
-      };
-    }
-    const res = await fetch(endpoint,{method:"POST",headers,body:JSON.stringify(body)});
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514", max_tokens: 600, system: SYSTEM,
+        messages: [{ role: "user", content: `LIVE SYSTEM STATE:\n${JSON.stringify(context, null, 2)}\n\nOPERATOR: ${message}` }],
+      }),
+    });
     const data = await res.json();
-    const text = (usePalantir?data?.response?.message:data?.content?.[0]?.text)??"{}";
-    return NextResponse.json(JSON.parse(text.replace(/```json|```/g,"").trim()));
-  } catch(e) {
-    return NextResponse.json({action:"situation_synthesis",message:`AIP error: ${e instanceof Error?e.message:String(e)}`});
+    const text = (data?.content?.[0]?.text ?? "{}").replace(/```json|```/g, "").trim();
+    return NextResponse.json({ source: "anthropic", ...JSON.parse(text) });
+  } catch (e) {
+    return NextResponse.json({ action: "situation_synthesis", message: `Error: ${e instanceof Error ? e.message : String(e)}`, source: "error" });
   }
 }
