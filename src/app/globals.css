@@ -1,0 +1,43 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --amber: #e8a020;
+  --amber-dim: #9b6a10;
+  --amber-glow: #e8a02022;
+  --green: #22c55e;
+  --red: #ef4444;
+  --blue: #38bdf8;
+  --pink: #f472b6;
+  --bg: #080b0e;
+  --surface: #0d1117;
+  --border: #1e2830;
+  --text: #c8a96e;
+  --text-dim: #4a5a4a;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { background: var(--bg); color: var(--text); font-family: 'IBM Plex Mono', monospace; height: 100%; overflow: hidden; }
+
+body::after { content: ''; position: fixed; inset: 0; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.05) 2px, rgba(0,0,0,0.05) 4px); pointer-events: none; z-index: 9999; }
+
+.panel { background: var(--surface); border: 1px solid var(--border); }
+.panel-header { font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--amber); border-bottom: 1px solid var(--border); padding: 6px 10px; font-family: 'Share Tech Mono', monospace; }
+
+.btn { font-family: 'Share Tech Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; padding: 6px 10px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); cursor: pointer; transition: all 0.15s; width: 100%; text-align: left; display: block; }
+.btn:hover { border-color: var(--amber); color: var(--amber); background: var(--amber-glow); }
+.btn-primary { border-color: var(--amber-dim); color: var(--amber); }
+.btn-danger:hover { border-color: var(--red); color: var(--red); background: rgba(239,68,68,0.08); }
+
+.log-line { font-size: 10px; font-family: 'Share Tech Mono', monospace; color: var(--text-dim); padding: 3px 0; border-bottom: 1px solid rgba(30,40,48,0.5); line-height: 1.4; }
+
+.aip-input { width: 100%; background: #060809; border: 1px solid var(--border); color: var(--amber); font-family: 'Share Tech Mono', monospace; font-size: 11px; padding: 8px 10px; outline: none; caret-color: var(--amber); resize: none; }
+.aip-input:focus { border-color: var(--amber-dim); }
+.aip-input::placeholder { color: #1e2820; }
+
+@keyframes pulse-amber { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+.pulse { animation: pulse-amber 1.5s infinite; }
