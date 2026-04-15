@@ -88,6 +88,8 @@ export default function Home(){
   const[weightEdit,setWeightEdit]=useState(false);
   const[weights,setWeights]=useState<ScoringWeights>({...DEFAULT_WEIGHTS});
   const[simRunning,setSimRunning]=useState(false);
+  const prevStateRef=useRef<SystemState|null>(null);
+  const[prevState,setPrevState]=useState<SystemState|null>(null);
   const logRef=useRef<HTMLDivElement>(null);
 
   // ── Initial data load ─────────────────────────────────────────────────────
@@ -124,6 +126,12 @@ export default function Home(){
   },[]);
 
   useEffect(()=>{if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;},[state.log]);
+
+  // Track previous state for change detection
+  useEffect(()=>{
+    setPrevState(prevStateRef.current);
+    prevStateRef.current=state;
+  },[state]);
 
   // ── Foundry writeback ─────────────────────────────────────────────────────
   const writeToFoundry=useCallback(async(actionType:string,parameters:Record<string,unknown>,taskId:string)=>{
@@ -213,7 +221,7 @@ export default function Home(){
   return(
     <div style={{position:"fixed",inset:0,overflow:"hidden",background:"var(--bg)"}}>
       <div style={{position:"absolute",inset:0}}>
-        <MapView state={state} onCountyClick={handleCountyClick} selectedFips={selectedFips}/>
+        <MapView state={state} prevState={prevState} onCountyClick={handleCountyClick} selectedFips={selectedFips}/>
       </div>
 
       {/* County detail overlay */}
