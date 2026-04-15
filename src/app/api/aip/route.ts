@@ -1,17 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const SYSTEM = `You are an AI mission advisor in a contested-environment logistics coordination system.
-You manage autonomous delivery assets (drones, ground vehicles) resupplying forward operating bases and outposts.
+const SYSTEM = `You are an AI advisor embedded in a Critical Infrastructure Response Coordinator for Georgia emergency management (FEMA/National Guard operations).
 
-Respond ONLY in raw JSON. No preamble. No markdown.
+You analyze real county-level data: NWS weather alerts, FEMA disaster declarations, Census vulnerability data (elderly, no-vehicle, poverty), and hospital locations.
 
-For CONSTRAINT updates: {"action":"update_constraints","weights":{"travel":<0-5>,"risk":<0-5>,"battery":<0-5>,"lateness":<0-5>,"priority":<0-5>,"cargo":<0-5>},"explanation":"<one sentence>"}
-For ASSET OVERRIDE: {"action":"override","taskId":"<id>","forceAssetType":"<drone|ground|null>","forceAssetId":"<id|null>","explanation":"<one sentence>"}
-For MISSION SUGGESTION: {"action":"suggest_mission","suggestedMission":{"sourceNodeId":"<id>","destNodeId":"<id>","cargoType":"<medevac|ammo|food|equipment|fuel>","quantity":<number>,"priority":<1-5>},"explanation":"<one sentence>"}
-For EXPLANATION: {"action":"explain","explanation":"<2-3 sentences grounded in the data>"}
+Respond ONLY in raw JSON. No markdown. No preamble.
 
-Node IDs available: N_FOB_ALPHA, N_DEPOT_B, N_OUT_C, N_OUT_D, N_LZ_ECHO
-Cargo types: medevac, ammo, food, equipment, fuel`;
+For SITUATION SYNTHESIS: {"action":"situation_synthesis","message":"<2-3 sentence operational summary naming specific counties and why>"}
+
+For RECOMMEND ACTIONS: {"action":"recommend_actions","message":"<specific actionable recommendations with county names and resource types>"}
+
+For EXPLAIN DECISION: {"action":"explain_decision","message":"<explain why a specific county ranks high or task was created, citing data points>"}
+
+For OPERATOR OVERRIDE (e.g. 'prioritize hospitals', 'focus on coastal counties'):
+{"action":"apply_override","message":"<what changed and why>","weightOverrides":{"weatherSeverity":<0-1>,"femaDeclaration":<0-1>,"populationExposure":<0-1>,"vulnerability":<0-1>,"criticalFacility":<0-1>}}
+
+For RESOURCE ANALYSIS: {"action":"resource_analysis","message":"<analysis of coverage gaps, shortfalls, and recommendations>"}
+
+Always cite specific county names, risk scores, and data sources. Never be generic.`;
 
 export async function POST(req: NextRequest) {
   const { message, context } = await req.json();
@@ -19,9 +25,8 @@ export async function POST(req: NextRequest) {
   const endpoint = process.env.AIP_ENDPOINT || "https://api.anthropic.com/v1/messages";
   const usePalantir = !!process.env.AIP_ENDPOINT;
 
-  if (!apiKey) {
-    return NextResponse.json({ action:"explain", explanation:"AI layer not configured. Set ANTHROPIC_API_KEY." });
-  }
+  if (!apiKey) return NextResponse.json({ action:"situation_synthesis", message:"AIP not configured. Set ANTHROPIC_API_KEY or AIP_TOKEN." });
+
   try {
     const headers: Record<string,string> = {"Content-Type":"application/json"};
     let body: object;
@@ -32,15 +37,15 @@ export async function POST(req: NextRequest) {
       headers["x-api-key"] = apiKey;
       headers["anthropic-version"] = "2023-06-01";
       body = {
-        model: "claude-sonnet-4-20250514", max_tokens: 512, system: SYSTEM,
-        messages: [{ role:"user", content:`SYSTEM STATE:\n${JSON.stringify(context,null,2)}\n\nOPERATOR: ${message}` }],
+        model:"claude-sonnet-4-20250514", max_tokens:600, system:SYSTEM,
+        messages:[{role:"user",content:`LIVE SYSTEM STATE:\n${JSON.stringify(context,null,2)}\n\nOPERATOR: ${message}`}],
       };
     }
-    const res = await fetch(endpoint, { method:"POST", headers, body:JSON.stringify(body) });
+    const res = await fetch(endpoint,{method:"POST",headers,body:JSON.stringify(body)});
     const data = await res.json();
-    const text = (usePalantir ? data?.response?.message : data?.content?.[0]?.text) ?? "{}";
+    const text = (usePalantir?data?.response?.message:data?.content?.[0]?.text)??"{}";
     return NextResponse.json(JSON.parse(text.replace(/```json|```/g,"").trim()));
   } catch(e) {
-    return NextResponse.json({ action:"explain", explanation:`AIP error: ${e instanceof Error?e.message:String(e)}` });
+    return NextResponse.json({action:"situation_synthesis",message:`AIP error: ${e instanceof Error?e.message:String(e)}`});
   }
 }

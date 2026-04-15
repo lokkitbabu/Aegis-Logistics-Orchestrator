@@ -1,120 +1,171 @@
-export type Vec2 = [number, number];
-export type AssetType = "drone" | "ground";
-export type TaskStatus = "pending" | "approved" | "assigned" | "in_progress" | "complete" | "failed" | "cancelled";
-export type ZoneType = "threat" | "no_go" | "gps_denied";
-export type CargoType = "medevac" | "ammo" | "food" | "equipment" | "fuel";
-export type NodeType = "fob" | "depot" | "outpost" | "lz";
+// ── Alert / Hazard ─────────────────────────────────────────────────────────────
+export type AlertLevel = "none" | "advisory" | "watch" | "warning" | "emergency";
+export type AlertSeverity = "Minor" | "Moderate" | "Severe" | "Extreme";
 
-export const CARGO_PRIORITY: Record<CargoType, number> = {
-  medevac: 5, ammo: 4, fuel: 3, food: 2, equipment: 1,
-};
-export const CARGO_COLOR: Record<CargoType, string> = {
-  medevac: "#ff3040", ammo: "#ff8c00", fuel: "#f0a500", food: "#00ff88", equipment: "#00e5ff",
+export const ALERT_ORDER: Record<AlertLevel, number> = { none:0, advisory:1, watch:2, warning:3, emergency:4 };
+export const ALERT_COLOR: Record<AlertLevel, string> = {
+  none:"#334455", advisory:"#0088ff", watch:"#ffcc00", warning:"#ff6600", emergency:"#ff2020",
 };
 
-export interface CargoManifest {
-  type: CargoType;
-  quantity: number;
-  weightKg: number;
+export interface NWSAlert {
+  id: string; event: string; headline: string;
+  severity: AlertSeverity; certainty: string;
+  issuedAt: string; expiresAt: string;
+  level: AlertLevel;
+  affectedZones: string[]; // NWS zone IDs like "GAZ001"
+  affectedCountyFips: string[];
+  geometry: any; // GeoJSON geometry if available
+  description: string;
 }
 
-export interface SupplyNode {
-  id: string;
-  name: string;
-  pos: Vec2;
-  type: NodeType;
-  inventory: Record<CargoType, number>;
-  capacity:  Record<CargoType, number>;
-  demandPerTick: Record<CargoType, number>;
-  criticalThreshold: number; // 0-1, triggers auto-resupply
+// ── FEMA ──────────────────────────────────────────────────────────────────────
+export interface FEMADeclaration {
+  disasterNumber: string;
+  declarationType: string; // "Major Disaster", "Emergency"
+  incidentType: string; // "Hurricane", "Flood", etc.
+  declarationDate: string;
+  countyFips: string;
+  countyName: string;
+  state: string;
+  title: string;
 }
 
-export interface Asset {
-  id: string;
-  type: AssetType;
-  pos: Vec2;
-  homeNodeId: string;
-  battery: number;
-  maxBattery: number;
-  payloadCapacity: number;
-  currentTask: string | null;
-  route: Vec2[];
-  routeIdx: number;
-  status: "idle" | "en_route" | "returning" | "critical" | "recharging";
-  cargo: CargoManifest[];
+// ── Facilities ────────────────────────────────────────────────────────────────
+export interface Hospital {
+  id: string; name: string;
+  countyFips: string; countyName: string;
+  beds: number; type: string;
+  lat: number; lng: number;
 }
 
-export interface Task {
-  id: string;
-  sourceNodeId: string;
-  destNodeId: string;
-  pickup: Vec2;
-  dropoff: Vec2;
-  priority: number;
-  cargo: CargoManifest[];
-  totalWeightKg: number;
-  deadlineTicks: number;
+// ── County ────────────────────────────────────────────────────────────────────
+export interface CountyData {
+  fips: string; // 5-digit
+  name: string; state: string;
+  // Census ACS
+  population: number;
+  elderlyCount: number;
+  noVehicleHouseholds: number;
+  povertyCount: number;
+  // Derived
+  elderlyPct: number; noVehiclePct: number; povertyPct: number;
+  vulnerabilityScore: number; // 0–1
+  // Live
+  alertLevel: AlertLevel;
+  alerts: NWSAlert[];
+  hasDeclaration: boolean;
+  declarations: FEMADeclaration[];
+  hospitals: Hospital[];
+  // Computed
+  riskScore: number; // 0–1
+  riskRank: number;
+  impactedPopulation: number;
+  // GeoJSON feature (injected client-side)
+  geojsonFeature?: any;
+}
+
+// ── Resources ─────────────────────────────────────────────────────────────────
+export type ResourceType = "assessment_crew" | "generator_team" | "supply_truck" | "shelter_team" | "medical_team";
+export const RESOURCE_ICON: Record<ResourceType, string> = {
+  assessment_crew:"👷", generator_team:"⚡", supply_truck:"🚛", shelter_team:"🏕", medical_team:"🏥",
+};
+export const RESOURCE_COLOR: Record<ResourceType, string> = {
+  assessment_crew:"#00e5ff", generator_team:"#f0a500", supply_truck:"#88ff44",
+  shelter_team:"#ff88cc", medical_team:"#ff3040",
+};
+
+export interface ResponseResource {
+  id: string; type: ResourceType; label: string;
+  baseFips: string; baseName: string;
+  capacity: number; // units / teams
+  status: "available" | "deployed" | "unavailable";
+  assignedTaskId: string | null;
+  assignedFips: string | null;
+  lat: number; lng: number;
+  notes?: string;
+}
+
+// ── Tasks ──────────────────────────────────────────────────────────────────────
+export type TaskType = "damage_assessment" | "facility_check" | "shelter_support" | "resource_staging" | "evacuation_support";
+export type TaskStatus = "pending" | "assigned" | "in_progress" | "complete" | "cancelled";
+
+export const TASK_ICON: Record<TaskType, string> = {
+  damage_assessment:"🔍", facility_check:"🏥", shelter_support:"🏕",
+  resource_staging:"📦", evacuation_support:"🚨",
+};
+export const TASK_COLOR: Record<TaskType, string> = {
+  damage_assessment:"#00e5ff", facility_check:"#ff3040", shelter_support:"#ff88cc",
+  resource_staging:"#f0a500", evacuation_support:"#ff2020",
+};
+
+export interface ResponseTask {
+  id: string; type: TaskType; title: string;
+  targetFips: string; targetName: string;
+  priorityScore: number; // 0–100
   status: TaskStatus;
-  assignedAsset: string | null;
-  createdTick: number;
-  approvedTick: number | null;
-  completedTick: number | null;
-  riskScore: number;
+  assignedResourceId: string | null;
+  triggerReason: string;
+  description: string;
+  createdAt: string;
+  deadlineHours: number;
+  compatibleTypes: ResourceType[];
 }
 
-export interface Zone {
-  id: string;
-  cells: Vec2[];
-  type: ZoneType;
-  riskScore: number;
+// ── Scoring ────────────────────────────────────────────────────────────────────
+export interface ScoringWeights {
+  weatherSeverity: number;
+  femaDeclaration: number;
+  populationExposure: number;
+  vulnerability: number;
+  criticalFacility: number;
 }
-
-export interface WeatherState {
-  windVec: Vec2;      // dx,dy in cells/tick effect
-  windSpeed: number;  // 0-1
-  visibility: number; // 0-1, affects GPS
-}
-
-export interface LogEntry { tick: number; msg: string; }
-
-export interface WorldState {
-  gridSize: number;
-  assets: Record<string, Asset>;
-  tasks: Record<string, Task>;
-  nodes: Record<string, SupplyNode>;
-  zones: Zone[];
-  gpsDenied: Vec2[];
-  weather: WeatherState;
-  tick: number;
-  log: LogEntry[];
-  taskCounter: number;
-}
-
-export interface PlannerWeights {
-  travel: number;
-  risk: number;
-  battery: number;
-  lateness: number;
-  priority: number;
-  cargo: number;
-}
-export const DEFAULT_WEIGHTS: PlannerWeights = {
-  travel: 1.0, risk: 2.5, battery: 1.5,
-  lateness: 3.0, priority: 2.0, cargo: 1.5,
+export const DEFAULT_WEIGHTS: ScoringWeights = {
+  weatherSeverity:0.35, femaDeclaration:0.20,
+  populationExposure:0.15, vulnerability:0.20, criticalFacility:0.10,
 };
 
+// ── System State ──────────────────────────────────────────────────────────────
+export interface DataFreshness {
+  nws: string | null; fema: string | null; census: string | null; hospitals: string | null;
+}
+
+export interface LogEntry {
+  id: string; timestamp: string;
+  level: "info" | "warning" | "critical" | "action" | "aip";
+  message: string;
+}
+
+export interface SystemState {
+  counties: Record<string, CountyData>;
+  alerts: NWSAlert[];
+  declarations: FEMADeclaration[];
+  hospitals: Hospital[];
+  resources: Record<string, ResponseResource>;
+  tasks: Record<string, ResponseTask>;
+  countyGeoJSON: any | null; // Full GA county FeatureCollection
+  freshness: DataFreshness;
+  taskCounter: number;
+  logCounter: number;
+  log: LogEntry[];
+  weights: ScoringWeights;
+  isLoading: boolean;
+  loadingStage: string;
+  shortfallAnalysis: ShortfallAnalysis | null;
+}
+
+export interface ShortfallAnalysis {
+  highPriorityTasks: number;
+  coveredTasks: number;
+  uncoveredTasks: number;
+  uncoveredFips: string[];
+  shortfallByType: Partial<Record<ResourceType, number>>;
+  summary: string;
+}
+
+// ── AIP ───────────────────────────────────────────────────────────────────────
 export interface AIPResponse {
-  action: "update_constraints" | "override" | "explain" | "suggest_mission";
-  weights?: Partial<PlannerWeights>;
-  taskId?: string;
-  forceAssetType?: AssetType;
-  forceAssetId?: string;
-  suggestedMission?: {
-    sourceNodeId: string;
-    destNodeId: string;
-    cargoType: CargoType;
-    quantity: number;
-    priority: number;
-  };
-  explanation: string;
+  action: "situation_synthesis" | "recommend_actions" | "explain_decision" | "apply_override" | "resource_analysis";
+  message: string;
+  weightOverrides?: Partial<ScoringWeights>;
+  forceHighPriorityFips?: string[];
 }

@@ -1,395 +1,515 @@
 "use client";
 import { useReducer, useEffect, useRef, useState, useCallback } from "react";
 import dynamic from "next/dynamic";
-import type { WorldState, PlannerWeights, AIPResponse, Task, CargoType } from "@/lib/types";
-import { CARGO_COLOR, CARGO_PRIORITY, DEFAULT_WEIGHTS } from "@/lib/types";
+import type {
+  SystemState, CountyData, ResponseTask, ResponseResource,
+  NWSAlert, AIPResponse, ScoringWeights, TaskStatus,
+} from "@/lib/types";
 import {
-  buildDemoScenario, simulatorTick, runPlanningCycle, replanAll,
-  injectThreatZone, injectGpsDenial, addUrgentTask, deteriorateWeather,
-  approveTask, cancelTask, applyAIPResponse,
+  ALERT_COLOR, TASK_COLOR, TASK_ICON, RESOURCE_COLOR, RESOURCE_ICON,
+  DEFAULT_WEIGHTS,
+} from "@/lib/types";
+import {
+  buildInitialState, ingestAlerts, ingestDeclarations, ingestCensus, ingestHospitals,
+  recomputeAllRiskScores, autoGenerateTasks, runAssignmentCycle,
+  applyWeightOverride, cancelTask, approveTask,
 } from "@/lib/engine";
 
-const MapView = dynamic(() => import("@/components/MapView"), { ssr:false });
+const MapView = dynamic(() => import("@/components/MapView"), { ssr: false });
 
+// ── Reducer ───────────────────────────────────────────────────────────────────
 type Action =
-  | {type:"TICK"} | {type:"PLAN"} | {type:"THREAT"} | {type:"GPS"}
-  | {type:"URGENT"} | {type:"RESET"} | {type:"WEATHER"}
-  | {type:"APPROVE"; taskId:string} | {type:"CANCEL"; taskId:string}
-  | {type:"AIP"; payload:AIPResponse};
+  | { type:"SET_LOADING"; stage:string }
+  | { type:"SET_COUNTIES_GEO"; geojson:any }
+  | { type:"INGEST_ALERTS"; alerts:any[] }
+  | { type:"INGEST_FEMA"; declarations:any[] }
+  | { type:"INGEST_CENSUS"; counties:Record<string,any> }
+  | { type:"INGEST_HOSPITALS"; hospitals:any[]; counties:Record<string,any> }
+  | { type:"APPLY_WEIGHTS"; overrides:Partial<ScoringWeights> }
+  | { type:"CANCEL_TASK"; taskId:string }
+  | { type:"APPROVE_TASK"; taskId:string }
+  | { type:"REFRESH_NWS" }
+  | { type:"AIP_RESPONSE"; response:AIPResponse }
+  | { type:"SET_FRESHNESS"; key:string; value:string };
 
-interface AppState { world:WorldState; weights:PlannerWeights; lastAIP:AIPResponse|null; }
-
-function reducer(s: AppState, a: Action): AppState {
-  let w=s.world, wt=s.weights;
-  switch(a.type) {
-    case "TICK":    w=simulatorTick(w,wt); w=runPlanningCycle(w,wt); return {...s,world:w};
-    case "PLAN":    w=runPlanningCycle(w,wt); return {...s,world:w};
-    case "THREAT":  w=injectThreatZone(w); w=replanAll(w,wt,"threat zone"); return {...s,world:w};
-    case "GPS":     w=injectGpsDenial(w); w=replanAll(w,wt,"GPS degraded"); return {...s,world:w};
-    case "URGENT":  w=addUrgentTask(w); w=runPlanningCycle(w,wt); return {...s,world:w};
-    case "WEATHER": w=deteriorateWeather(w); return {...s,world:w};
-    case "RESET":   return {world:buildDemoScenario(),weights:{...DEFAULT_WEIGHTS},lastAIP:null};
-    case "APPROVE": w=approveTask(w,a.taskId); w=runPlanningCycle(w,wt); return {...s,world:w};
-    case "CANCEL":  w=cancelTask(w,a.taskId,wt); return {...s,world:w};
-    case "AIP": {
-      let nw=wt;
-      w=applyAIPResponse(w,a.payload,wt,x=>{nw=x;});
-      return {...s,world:w,weights:nw,lastAIP:a.payload};
+function reducer(state: SystemState, action: Action): SystemState {
+  switch (action.type) {
+    case "SET_LOADING": return { ...state, isLoading:true, loadingStage:action.stage };
+    case "SET_COUNTIES_GEO": return { ...state, countyGeoJSON:action.geojson };
+    case "INGEST_ALERTS": {
+      let s = ingestAlerts(state, action.alerts);
+      return { ...s, isLoading:false, freshness:{...s.freshness, nws:new Date().toISOString()} };
     }
-    default: return s;
+    case "INGEST_FEMA": return ingestDeclarations(state, action.declarations);
+    case "INGEST_CENSUS": return ingestCensus(state, action.counties);
+    case "INGEST_HOSPITALS": {
+      // Join hospitals to counties by county name
+      const hosps = action.hospitals.map((h:any) => {
+        const match = Object.values(action.counties).find((c:any) => c.name?.toUpperCase()===h.countyName?.replace(" COUNTY","").toUpperCase());
+        return {...h, countyFips:(match as any)?.fips??""};
+      }).filter((h:any)=>h.countyFips);
+      return ingestHospitals(state, hosps);
+    }
+    case "APPLY_WEIGHTS": return applyWeightOverride(state, action.overrides);
+    case "CANCEL_TASK": return cancelTask(state, action.taskId);
+    case "APPROVE_TASK": return approveTask(state, action.taskId);
+    case "AIP_RESPONSE": {
+      const r = action.response;
+      let s = { ...state,
+        log:[...state.log.slice(-199),{id:`L${state.logCounter+1}`,timestamp:new Date().toISOString(),level:"aip" as const,message:`💬 AIP: ${r.message}`}],
+        logCounter:state.logCounter+1,
+      };
+      if (r.weightOverrides) s = applyWeightOverride(s, r.weightOverrides);
+      return s;
+    }
+    default: return state;
   }
 }
 
-const ASSET_COLORS: Record<string,string> = {D1:"#00e5ff",D2:"#ff44aa",G1:"#00ff88"};
-const TASK_STATUS_COLOR: Record<string,string> = {
-  pending:"#f0a500",approved:"#00e5ff",assigned:"#44aaff",
-  in_progress:"#44aaff",complete:"#00ff88",failed:"#ff3040",cancelled:"#444",
-};
-
-type RightTab = "aip"|"supply"|"missions";
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+type RTab = "tasks"|"resources"|"aip"|"ontology";
 
 export default function Home() {
-  const [state,dispatch] = useReducer(reducer,{world:buildDemoScenario(),weights:{...DEFAULT_WEIGHTS},lastAIP:null});
-  const [autoRun,setAutoRun]   = useState(false);
-  const [aipInput,setAipInput] = useState("");
-  const [aipLoading,setAipLoading] = useState(false);
-  const [rightTab,setRightTab] = useState<RightTab>("missions");
-  const [showRanges,setShowRanges] = useState(false);
-  const autoRef = useRef<ReturnType<typeof setInterval>|null>(null);
-  const logRef  = useRef<HTMLDivElement>(null);
+  const [state, dispatch] = useReducer(reducer, buildInitialState());
+  const [tab, setTab] = useState<RTab>("tasks");
+  const [selectedFips, setSelectedFips] = useState<string | null>(null);
+  const [aipInput, setAipInput] = useState("");
+  const [aipLoading, setAipLoading] = useState(false);
+  const [lastAIP, setLastAIP] = useState<AIPResponse | null>(null);
+  const [weightEdit, setWeightEdit] = useState(false);
+  const [weights, setWeights] = useState<ScoringWeights>({ ...DEFAULT_WEIGHTS });
+  const logRef = useRef<HTMLDivElement>(null);
 
-  useEffect(()=>{
-    if(autoRun) autoRef.current=setInterval(()=>dispatch({type:"TICK"}),500);
-    else if(autoRef.current) clearInterval(autoRef.current);
-    return ()=>{if(autoRef.current)clearInterval(autoRef.current);};
-  },[autoRun]);
+  // ── Data loading ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    async function loadAll() {
+      // 1. County GeoJSON
+      dispatch({ type:"SET_LOADING", stage:"Loading Georgia county boundaries..." });
+      try {
+        const geo = await fetch("/api/counties").then(r=>r.json());
+        dispatch({ type:"SET_COUNTIES_GEO", geojson:geo });
+      } catch {}
 
-  useEffect(()=>{ if(logRef.current) logRef.current.scrollTop=logRef.current.scrollHeight; },[state.world.log]);
+      // 2. Census (baseline data, no external API limits)
+      dispatch({ type:"SET_LOADING", stage:"Loading Census vulnerability data..." });
+      try {
+        const census = await fetch("/api/census").then(r=>r.json());
+        if (census.counties) dispatch({ type:"INGEST_CENSUS", counties:census.counties });
+      } catch {}
 
-  const sendAIP = useCallback(async()=>{
-    if(!aipInput.trim()||aipLoading) return;
+      // 3. FEMA declarations
+      dispatch({ type:"SET_LOADING", stage:"Loading FEMA disaster declarations..." });
+      try {
+        const fema = await fetch("/api/fema").then(r=>r.json());
+        if (fema.declarations) dispatch({ type:"INGEST_FEMA", declarations:fema.declarations });
+      } catch {}
+
+      // 4. Hospitals
+      dispatch({ type:"SET_LOADING", stage:"Loading HIFLD hospital data..." });
+      try {
+        const [hosp, census2] = await Promise.all([
+          fetch("/api/hospitals").then(r=>r.json()),
+          fetch("/api/census").then(r=>r.json()),
+        ]);
+        if (hosp.hospitals) dispatch({ type:"INGEST_HOSPITALS", hospitals:hosp.hospitals, counties:census2.counties??{} });
+      } catch {}
+
+      // 5. NWS alerts (live)
+      dispatch({ type:"SET_LOADING", stage:"Fetching live NWS alerts..." });
+      try {
+        const nws = await fetch("/api/nws").then(r=>r.json());
+        dispatch({ type:"INGEST_ALERTS", alerts:nws.alerts??[] });
+      } catch {
+        dispatch({ type:"INGEST_ALERTS", alerts:[] });
+      }
+    }
+    loadAll();
+  }, []);
+
+  // Refresh NWS every 2 minutes
+  useEffect(() => {
+    const iv = setInterval(async () => {
+      try {
+        const nws = await fetch("/api/nws").then(r=>r.json());
+        dispatch({ type:"INGEST_ALERTS", alerts:nws.alerts??[] });
+      } catch {}
+    }, 120000);
+    return () => clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [state.log]);
+
+  const sendAIP = useCallback(async () => {
+    if (!aipInput.trim() || aipLoading) return;
     setAipLoading(true);
+    const topCounties = Object.values(state.counties).sort((a,b)=>b.riskScore-a.riskScore).slice(0,15).map(c=>({
+      fips:c.fips, name:c.name, riskScore:+(c.riskScore*100).toFixed(1),
+      alertLevel:c.alertLevel, alerts:c.alerts.map(a=>a.event).slice(0,2),
+      hasDeclaration:c.hasDeclaration, hospitals:c.hospitals.length,
+      vulnerability:+(c.vulnerabilityScore*100).toFixed(1), population:c.population,
+    }));
     const ctx = {
-      tick:state.world.tick,
-      assets:Object.values(state.world.assets).map(a=>({id:a.id,type:a.type,battery:a.battery,status:a.status,currentTask:a.currentTask,pos:a.pos,cargo:a.cargo})),
-      tasks:Object.values(state.world.tasks).filter(t=>!["complete","cancelled"].includes(t.status)).map(t=>({id:t.id,status:t.status,priority:t.priority,cargo:t.cargo,sourceNodeId:t.sourceNodeId,destNodeId:t.destNodeId,riskScore:t.riskScore})),
-      nodes:Object.values(state.world.nodes).map(n=>({id:n.id,name:n.name,type:n.type,inventory:n.inventory})),
-      weather:state.world.weather,
-      threatZones:state.world.zones.filter(z=>z.type==="threat").length,
-      gpsDenied:state.world.gpsDenied.length>0,
-      plannerWeights:state.weights,
+      topCountiesByRisk:topCounties,
+      totalAlerts:state.alerts.length, totalTasks:Object.keys(state.tasks).length,
+      pendingTasks:Object.values(state.tasks).filter(t=>t.status==="pending").length,
+      assignedTasks:Object.values(state.tasks).filter(t=>t.status==="assigned").length,
+      availableResources:Object.values(state.resources).filter(r=>r.status==="available").length,
+      shortfall:state.shortfallAnalysis?.summary,
+      currentWeights:state.weights,
     };
     try {
-      const res=await fetch("/api/aip",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:aipInput,context:ctx})});
-      dispatch({type:"AIP",payload:await res.json()});
+      const res = await fetch("/api/aip",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:aipInput,context:ctx})});
+      const r: AIPResponse = await res.json();
+      setLastAIP(r);
+      dispatch({ type:"AIP_RESPONSE", response:r });
       setAipInput("");
     } finally { setAipLoading(false); }
-  },[aipInput,aipLoading,state]);
+  }, [aipInput, aipLoading, state]);
 
-  const {world,weights,lastAIP} = state;
-  const activeTasks  = Object.values(world.tasks).filter(t=>["assigned","in_progress"].includes(t.status));
-  const pendingTasks = Object.values(world.tasks).filter(t=>t.status==="pending");
-  const approvedTasks= Object.values(world.tasks).filter(t=>t.status==="approved");
-  const doneTasks    = Object.values(world.tasks).filter(t=>t.status==="complete");
+  const applyWeights = () => {
+    dispatch({ type:"APPLY_WEIGHTS", overrides:weights });
+    setWeightEdit(false);
+  };
+
+  const { counties, tasks, resources, alerts, shortfallAnalysis, log, freshness } = state;
+  const sortedCounties = Object.values(counties).sort((a,b)=>b.riskScore-a.riskScore).filter(c=>c.population>0);
+  const taskList = Object.values(tasks).sort((a,b)=>b.priorityScore-a.priorityScore);
+  const pendingTasks = taskList.filter(t=>t.status==="pending");
+  const activeTasks  = taskList.filter(t=>["assigned","in_progress"].includes(t.status));
+  const selectedCounty = selectedFips ? counties[selectedFips] : null;
 
   return (
-    <div style={{position:"fixed",inset:0,overflow:"hidden",background:"#040810"}}>
-      {/* Map full screen */}
-      <div style={{position:"absolute",inset:0}}>
-        <MapView state={world} showRanges={showRanges}/>
+    <div style={{ position:"fixed", inset:0, overflow:"hidden", background:"var(--bg)" }}>
+      {/* Map */}
+      <div style={{ position:"absolute", inset:0 }}>
+        <MapView state={state} onCountyClick={setSelectedFips} selectedFips={selectedFips} />
       </div>
 
       {/* ── TOP HUD ─────────────────────────────────────────────── */}
-      <div style={{position:"absolute",top:0,left:0,right:0,zIndex:100,
-        background:"linear-gradient(180deg,rgba(2,6,12,0.97) 0%,rgba(2,6,12,0.5) 100%)",
-        borderBottom:"1px solid rgba(0,200,255,0.12)",padding:"7px 16px",
-        display:"flex",alignItems:"center",justifyContent:"space-between",backdropFilter:"blur(8px)"}}>
-        <div style={{display:"flex",alignItems:"center",gap:14}}>
-          <span style={{fontFamily:"'Rajdhani',sans-serif",fontSize:15,fontWeight:700,color:"#00e5ff",letterSpacing:"0.3em"}}>▣ AEGIS</span>
-          <div style={{width:1,height:18,background:"rgba(0,200,255,0.18)"}}/>
-          <span style={{fontFamily:"'Share Tech Mono',monospace",fontSize:8,color:"rgba(0,200,255,0.45)",letterSpacing:"0.2em"}}>LOGISTICS ORCHESTRATOR</span>
-          <div style={{width:1,height:18,background:"rgba(0,200,255,0.18)"}}/>
-          <span style={{fontFamily:"'Share Tech Mono',monospace",fontSize:8,color:"rgba(0,200,255,0.35)",letterSpacing:"0.12em"}}>AOR: NEVADA TEST & TRAINING RANGE · 37°N 116°W</span>
+      <div style={{ position:"absolute", top:0, left:0, right:0, zIndex:100, background:"linear-gradient(180deg,rgba(4,6,10,0.97) 0%,rgba(4,6,10,0.6) 100%)", borderBottom:"1px solid rgba(255,120,0,0.15)", padding:"7px 16px", display:"flex", alignItems:"center", justifyContent:"space-between", backdropFilter:"blur(8px)" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+          <div style={{ fontFamily:"'Rajdhani',sans-serif", fontSize:15, fontWeight:700, color:"var(--orange)", letterSpacing:"0.3em" }}>AEGIS</div>
+          <div style={{ width:1, height:18, background:"rgba(255,120,0,0.2)" }}/>
+          <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,120,0,0.5)", letterSpacing:"0.2em" }}>CRITICAL INFRASTRUCTURE RESPONSE COORDINATOR</div>
+          <div style={{ width:1, height:18, background:"rgba(255,120,0,0.2)" }}/>
+          <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,120,0,0.35)" }}>GEORGIA STATE EMERGENCY OPERATIONS</div>
         </div>
-        <div style={{display:"flex",alignItems:"center",gap:16,fontFamily:"'Share Tech Mono',monospace"}}>
-          <HudStat label="TICK"     value={String(world.tick).padStart(3,"0")} color="#00e5ff"/>
-          <HudStat label="PENDING"  value={String(pendingTasks.length)}  color="#f0a500"/>
-          <HudStat label="QUEUED"   value={String(approvedTasks.length)} color="#00e5ff"/>
-          <HudStat label="ACTIVE"   value={String(activeTasks.length)}   color="#44aaff"/>
-          <HudStat label="COMPLETE" value={String(doneTasks.length)}      color="#00ff88"/>
-          <div style={{width:1,height:16,background:"rgba(0,200,255,0.12)"}}/>
-          <div style={{display:"flex",gap:6,fontSize:9}}>
-            <ToggleBtn active={showRanges} onClick={()=>setShowRanges(v=>!v)} label="RANGES"/>
+        <div style={{ display:"flex", alignItems:"center", gap:16, fontFamily:"'Share Tech Mono',monospace" }}>
+          {/* Data freshness */}
+          <DataPill label="NWS" ts={freshness.nws} warn={!freshness.nws} />
+          <DataPill label="FEMA" ts={freshness.fema} warn={!freshness.fema} />
+          <DataPill label="CENSUS" ts={freshness.census} warn={!freshness.census} />
+          <DataPill label="HIFLD" ts={freshness.hospitals} warn={!freshness.hospitals} />
+          <div style={{ width:1, height:14, background:"rgba(255,120,0,0.15)" }}/>
+          <HudStat label="ALERTS"   value={String(alerts.length)}              color={alerts.length>0?"#ff6600":"#555"} />
+          <HudStat label="COUNTIES" value={String(sortedCounties.filter(c=>c.riskScore>0.35).length)} color="#f0a500" />
+          <HudStat label="TASKS"    value={String(taskList.length)}            color="#ffcc00" />
+          <HudStat label="UNCOVER"  value={String(shortfallAnalysis?.uncoveredTasks??0)} color={shortfallAnalysis?.uncoveredTasks?"#ff2020":"#555"} />
+          {state.isLoading && <div style={{ fontSize:8, color:"rgba(255,120,0,0.6)", letterSpacing:"0.1em" }} className="pulse-warn">{state.loadingStage}</div>}
+        </div>
+      </div>
+
+      {/* ── LEFT: County Rankings ─────────────────────────────── */}
+      <div className="panel" style={{ position:"absolute", left:10, top:50, bottom:10, width:215, zIndex:100, display:"flex", flexDirection:"column", borderRadius:2, overflow:"hidden" }}>
+        <div className="panel-header" style={{ display:"flex", justifyContent:"space-between" }}>
+          <span>COUNTY RISK RANKING</span>
+          <span style={{ color:"rgba(255,120,0,0.4)", fontSize:8 }}>{sortedCounties.length} COUNTIES</span>
+        </div>
+        <div style={{ flex:1, overflowY:"auto" }}>
+          {sortedCounties.slice(0,50).map((county, i) => (
+            <CountyRow key={county.fips} county={county} rank={i+1} isSelected={selectedFips===county.fips} onClick={()=>setSelectedFips(county.fips)} />
+          ))}
+        </div>
+
+        {/* Selected county detail */}
+        {selectedCounty && (
+          <div style={{ borderTop:"1px solid rgba(255,120,0,0.15)", padding:"8px 10px", background:"rgba(0,0,0,0.4)" }}>
+            <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:"var(--orange)", marginBottom:5, letterSpacing:"0.1em" }}>{selectedCounty.name.toUpperCase()} CO. DETAIL</div>
+            <DataRow label="POPULATION"  value={selectedCounty.population.toLocaleString()} />
+            <DataRow label="ELDERLY"     value={`${selectedCounty.elderlyPct?.toFixed(1)??0}%`} warn={selectedCounty.elderlyPct>18}/>
+            <DataRow label="NO VEHICLE"  value={`${selectedCounty.noVehiclePct?.toFixed(1)??0}%`} warn={selectedCounty.noVehiclePct>12}/>
+            <DataRow label="POVERTY"     value={`${selectedCounty.povertyPct?.toFixed(1)??0}%`} warn={selectedCounty.povertyPct>20}/>
+            <DataRow label="HOSPITALS"   value={String(selectedCounty.hospitals.length)} warn={selectedCounty.hospitals.length===0}/>
+            <DataRow label="RISK SCORE"  value={`${(selectedCounty.riskScore*100).toFixed(0)}%`} color={selectedCounty.riskScore>0.6?"#ff3020":selectedCounty.riskScore>0.35?"#f0a500":"#00cc44"}/>
+            <DataRow label="ALERT"       value={selectedCounty.alertLevel.toUpperCase()} color={ALERT_COLOR[selectedCounty.alertLevel]}/>
+            {selectedCounty.alerts.slice(0,2).map((a,i)=>(<div key={i} style={{fontSize:8,color:"rgba(255,120,0,0.5)",fontFamily:"'Share Tech Mono',monospace",marginTop:2,paddingLeft:4,borderLeft:`2px solid ${ALERT_COLOR[a.level]}`}}>{a.event}</div>))}
+            {selectedCounty.hasDeclaration && <div style={{ marginTop:3, fontSize:8, color:"#ffcc00", fontFamily:"'Share Tech Mono',monospace" }}>⚡ FEMA DECLARED</div>}
           </div>
-          {autoRun&&<span style={{color:"#00ff88",fontSize:9,fontFamily:"'Share Tech Mono',monospace"}} className="blink">● LIVE</span>}
-        </div>
-      </div>
+        )}
 
-      {/* ── LEFT PANEL ──────────────────────────────────────────── */}
-      <div className="panel" style={{position:"absolute",left:10,top:50,bottom:10,width:172,zIndex:100,display:"flex",flexDirection:"column",borderRadius:2,overflow:"hidden"}}>
-        <div className="panel-header">MISSION CONTROLS</div>
-        <div style={{padding:"8px 8px 4px",display:"flex",flexDirection:"column",gap:3}}>
-          <button className={`btn btn-primary ${autoRun?"blink":""}`} onClick={()=>setAutoRun(v=>!v)}>{autoRun?"⏸  PAUSE":"▶  AUTO-RUN"}</button>
-          <button className="btn" onClick={()=>dispatch({type:"TICK"})}>▷  STEP TICK</button>
-          <button className="btn" onClick={()=>dispatch({type:"PLAN"})}>↻  REPLAN NOW</button>
-        </div>
-
-        <div className="panel-header" style={{marginTop:4}}>INJECT EVENT</div>
-        <div style={{padding:"8px 8px 4px",display:"flex",flexDirection:"column",gap:3}}>
-          <button className="btn btn-alert" onClick={()=>dispatch({type:"THREAT"})}>⚡  THREAT ZONE</button>
-          <button className="btn btn-alert" onClick={()=>dispatch({type:"GPS"})}>📡  GPS DEGRADE</button>
-          <button className="btn btn-alert" onClick={()=>dispatch({type:"WEATHER"})}>🌪  BAD WEATHER</button>
-          <button className="btn"           onClick={()=>dispatch({type:"URGENT"})}>🚨  URGENT MEDEVAC</button>
-          <button className="btn" style={{marginTop:4,borderColor:"rgba(255,48,64,0.15)",color:"rgba(255,48,64,0.4)"}} onClick={()=>dispatch({type:"RESET"})}>⊗  RESET MISSION</button>
-        </div>
-
-        <div className="panel-header" style={{marginTop:4}}>FLEET STATUS</div>
-        <div style={{flex:1,overflowY:"auto",padding:"8px"}}>
-          {Object.values(world.assets).map(a=>{
-            const color=ASSET_COLORS[a.id]??"#fff";
-            const bc=a.battery>40?"#00ff88":a.battery>15?"#f0a500":"#ff3040";
-            return (
-              <div key={a.id} style={{marginBottom:10,paddingBottom:8,borderBottom:"1px solid rgba(0,200,255,0.07)"}}>
-                <div style={{color,fontFamily:"'Share Tech Mono',monospace",fontSize:10,marginBottom:2,display:"flex",alignItems:"center",gap:6}}>
-                  <span>{a.type==="drone"?"✦":"◈"}</span><span>{a.id}</span>
-                  <span style={{color:"rgba(255,255,255,0.2)",fontSize:7}}>{a.type.toUpperCase()}</span>
+        {/* Weights panel */}
+        <div style={{ borderTop:"1px solid rgba(255,120,0,0.12)" }}>
+          <div className="panel-header" style={{ cursor:"pointer", display:"flex", justifyContent:"space-between" }} onClick={()=>setWeightEdit(!weightEdit)}>
+            <span>SCORING WEIGHTS</span>
+            <span style={{ color:"rgba(255,120,0,0.4)", fontSize:8 }}>{weightEdit?"▲":"▼"}</span>
+          </div>
+          {weightEdit ? (
+            <div style={{ padding:"6px 8px" }}>
+              {(Object.keys(weights) as (keyof ScoringWeights)[]).map(k => (
+                <div key={k} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
+                  <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:7, color:"rgba(255,120,0,0.6)", width:100 }}>{k.replace(/([A-Z])/g," $1").toUpperCase()}</span>
+                  <input type="range" min="0" max="1" step="0.05" value={weights[k]} onChange={e=>setWeights(w=>({...w,[k]:+e.target.value}))} style={{ flex:1, accentColor:"var(--orange)" }}/>
+                  <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"var(--orange)", width:28, textAlign:"right" }}>{weights[k].toFixed(2)}</span>
                 </div>
-                <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:8,color:"var(--text-dim)",lineHeight:1.8}}>
-                  <div>({a.pos[0]},{a.pos[1]}) · <span style={{color: a.status==="idle"?"#00ff8888":a.status==="critical"?"#ff3040":"var(--text-dim)"}}>{a.status.toUpperCase()}</span></div>
-                  <div>TASK: <span style={{color:a.currentTask?color:"rgba(255,255,255,0.15)"}}>{a.currentTask??"—"}</span></div>
-                  {a.cargo.length>0&&<div style={{color:"rgba(255,255,255,0.3)"}}>{a.cargo.map(c=>`${c.quantity}×${c.type.substring(0,3).toUpperCase()}`).join(" ")}</div>}
-                  <div>BATT <span style={{color:bc}}>{a.battery.toFixed(0)}%</span> · BASE {world.nodes[a.homeNodeId]?.name.split(" ")[1]??a.homeNodeId}</div>
-                </div>
-                <div style={{height:2,background:"rgba(255,255,255,0.05)",marginTop:3,borderRadius:1}}>
-                  <div style={{height:"100%",width:`${a.battery}%`,background:bc,borderRadius:1,transition:"width 0.4s"}}/>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="panel-header">PLANNER WEIGHTS</div>
-        <div style={{padding:"5px 8px 8px",fontFamily:"'Share Tech Mono',monospace",fontSize:8}}>
-          {Object.entries(weights).map(([k,v])=>(
-            <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"1.5px 0",color:"var(--text-dim)"}}>
-              <span>{k.toUpperCase()}</span><span style={{color:"var(--amber)"}}>{(v as number).toFixed(1)}</span>
+              ))}
+              <button className="btn btn-primary" style={{ marginTop:4, fontSize:8, padding:"4px" }} onClick={applyWeights}>APPLY & RECOMPUTE</button>
             </div>
-          ))}
+          ) : (
+            <div style={{ padding:"4px 8px", display:"flex", flexWrap:"wrap", gap:"3px 8px", fontFamily:"'Share Tech Mono',monospace", fontSize:7, color:"rgba(255,120,0,0.35)" }}>
+              {Object.entries(state.weights).map(([k,v])=><span key={k}>{k.replace(/([A-Z])/g," $1").toLowerCase().split(" ")[0]}:{v.toFixed(2)}</span>)}
+            </div>
+          )}
         </div>
       </div>
 
-      {/* ── RIGHT PANEL ─────────────────────────────────────────── */}
-      <div className="panel" style={{position:"absolute",right:10,top:50,bottom:10,width:270,zIndex:100,display:"flex",flexDirection:"column",borderRadius:2,overflow:"hidden"}}>
+      {/* ── RIGHT PANEL ──────────────────────────────────────── */}
+      <div className="panel" style={{ position:"absolute", right:10, top:50, bottom:10, width:295, zIndex:100, display:"flex", flexDirection:"column", borderRadius:2, overflow:"hidden" }}>
         {/* Tabs */}
-        <div style={{display:"flex",borderBottom:"1px solid rgba(0,200,255,0.12)"}}>
-          {(["missions","supply","aip"] as RightTab[]).map(tab=>(
-            <button key={tab} onClick={()=>setRightTab(tab)} style={{
-              flex:1,padding:"7px 4px",fontFamily:"'Share Tech Mono',monospace",fontSize:9,
-              letterSpacing:"0.12em",textTransform:"uppercase",cursor:"pointer",border:"none",
-              borderBottom: tab===rightTab?"2px solid #00e5ff":"2px solid transparent",
-              background:"transparent",
-              color:tab===rightTab?"#00e5ff":"rgba(0,200,255,0.3)",
-              transition:"all 0.15s",
-            }}>{tab.toUpperCase()}</button>
+        <div style={{ display:"flex", borderBottom:"1px solid rgba(255,120,0,0.12)" }}>
+          {(["tasks","resources","aip","ontology"] as RTab[]).map(t => (
+            <button key={t} onClick={()=>setTab(t)} style={{ flex:1, padding:"7px 2px", fontFamily:"'Share Tech Mono',monospace", fontSize:8, letterSpacing:"0.1em", textTransform:"uppercase", cursor:"pointer", border:"none", background:"transparent", borderBottom:`2px solid ${t===tab?"var(--orange)":"transparent"}`, color:t===tab?"var(--orange)":"rgba(255,120,0,0.3)", transition:"all 0.12s" }}>
+              {t==="tasks"?`TASKS (${taskList.length})`:t.toUpperCase()}
+            </button>
           ))}
         </div>
 
-        {/* MISSIONS tab */}
-        {rightTab==="missions"&&(
-          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-            <div className="panel-header" style={{display:"flex",justifyContent:"space-between"}}>
-              <span>MISSION QUEUE</span>
-              <span style={{color:"rgba(0,200,255,0.3)",fontSize:8}}>{Object.values(world.tasks).filter(t=>!["complete","cancelled"].includes(t.status)).length} ACTIVE</span>
+        {/* TASKS tab */}
+        {tab==="tasks" && (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+            {/* Shortfall banner */}
+            {shortfallAnalysis && shortfallAnalysis.uncoveredTasks > 0 && (
+              <div style={{ padding:"8px 10px", background:"rgba(255,32,32,0.08)", borderBottom:"1px solid rgba(255,32,32,0.2)", fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:"#ff6060", lineHeight:1.5 }}>
+                ⚠ RESOURCE SHORTFALL: {shortfallAnalysis.summary}
+              </div>
+            )}
+            {shortfallAnalysis && shortfallAnalysis.uncoveredTasks===0 && taskList.length>0 && (
+              <div style={{ padding:"6px 10px", background:"rgba(0,180,60,0.06)", borderBottom:"1px solid rgba(0,180,60,0.15)", fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(0,200,80,0.7)" }}>
+                ✓ All {shortfallAnalysis.highPriorityTasks} high-priority tasks covered
+              </div>
+            )}
+            <div className="panel-header" style={{ display:"flex", justifyContent:"space-between" }}>
+              <span>RESPONSE TASKS</span>
+              <span style={{ color:"rgba(255,120,0,0.4)", fontSize:8 }}>{pendingTasks.length} PENDING</span>
             </div>
-            <div style={{flex:1,overflowY:"auto"}}>
-              {Object.values(world.tasks).length===0&&(
-                <div style={{padding:"12px",fontFamily:"'Share Tech Mono',monospace",fontSize:9,color:"var(--text-dim)"}}>No missions yet. Run the simulation to auto-generate resupply tasks.</div>
+            <div style={{ flex:1, overflowY:"auto" }}>
+              {taskList.length===0 && (
+                <div style={{ padding:"16px 12px", fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:"rgba(255,255,255,0.2)", lineHeight:1.7 }}>
+                  Loading data...<br/>Tasks will auto-generate as counties are assessed.
+                </div>
               )}
-              {Object.values(world.tasks).sort((a,b)=>b.priority-a.priority).map(task=>(
-                <TaskCard key={task.id} task={task}
-                  onApprove={task.status==="pending"?()=>dispatch({type:"APPROVE",taskId:task.id}):undefined}
-                  onCancel={!["complete","cancelled","failed"].includes(task.status)?()=>dispatch({type:"CANCEL",taskId:task.id}):undefined}
-                  srcName={world.nodes[task.sourceNodeId]?.name??task.sourceNodeId}
-                  dstName={world.nodes[task.destNodeId]?.name??task.destNodeId}
+              {taskList.map(task => (
+                <TaskCard key={task.id} task={task} county={counties[task.targetFips]}
+                  resource={task.assignedResourceId ? resources[task.assignedResourceId] : null}
+                  onApprove={()=>dispatch({type:"APPROVE_TASK",taskId:task.id})}
+                  onCancel={()=>dispatch({type:"CANCEL_TASK",taskId:task.id})}
                 />
               ))}
             </div>
-            <div className="panel-header">DECISION FEED</div>
-            <div ref={logRef} style={{height:160,overflowY:"auto",padding:"5px 8px"}}>
-              {world.log.length===0?(
-                <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:9,color:"var(--text-dim)"}}>awaiting operations...</div>
-              ):world.log.map((e,i)=>{
-                const m=e.msg;
-                const c=m.includes("⚠")||m.includes("🔋")?"rgba(240,165,0,0.75)":m.includes("✓")?"rgba(0,255,136,0.75)":m.includes("🚨")?"rgba(255,48,64,0.75)":m.includes("↺")||m.includes("📡")||m.includes("🎯")||m.includes("🌪")?"rgba(0,229,255,0.75)":"";
-                return <div key={i} className="log-line" style={{color:c||undefined}}>
-                  <span style={{color:"rgba(0,200,255,0.18)",marginRight:5}}>[{String(e.tick).padStart(3,"0")}]</span>{m}
+
+            {/* Activity feed */}
+            <div className="panel-header">ACTIVITY FEED</div>
+            <div ref={logRef} style={{ height:150, overflowY:"auto", padding:"4px 8px" }}>
+              {[...log].reverse().map(e => {
+                const c = e.level==="critical"?"rgba(255,32,32,0.8)":e.level==="warning"?"rgba(255,120,0,0.75)":e.level==="action"?"rgba(0,200,80,0.75)":e.level==="aip"?"rgba(0,229,255,0.7)":"rgba(255,255,255,0.2)";
+                return <div key={e.id} className="log-line" style={{ color:c }}>
+                  <span style={{ color:"rgba(255,120,0,0.2)", marginRight:4 }}>{new Date(e.timestamp).toLocaleTimeString("en",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}</span>{e.message}
                 </div>;
               })}
             </div>
           </div>
         )}
 
-        {/* SUPPLY tab */}
-        {rightTab==="supply"&&(
-          <div style={{flex:1,overflowY:"auto"}}>
-            {Object.values(world.nodes).map(node=>{
-              const NODE_COLORS: Record<string,string> = {fob:"#00e5ff",depot:"#f0a500",outpost:"#ff6644",lz:"#88ff44"};
-              const color = NODE_COLORS[node.type]??"#fff";
-              const cargoEntries = Object.entries(node.inventory) as [CargoType,number][];
-              return (
-                <div key={node.id} style={{padding:"10px 10px 8px",borderBottom:"1px solid rgba(0,200,255,0.07)"}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-                    <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:10,color,letterSpacing:"0.1em"}}>{node.name}</div>
-                    <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:8,color:"rgba(255,255,255,0.2)",textTransform:"uppercase"}}>{node.type}</div>
+        {/* RESOURCES tab */}
+        {tab==="resources" && (
+          <div style={{ flex:1, overflowY:"auto" }}>
+            <div style={{ padding:"6px 10px 4px", fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:"rgba(255,120,0,0.5)", borderBottom:"1px solid rgba(255,120,0,0.08)" }}>
+              {Object.values(resources).filter(r=>r.status==="available").length} AVAILABLE · {Object.values(resources).filter(r=>r.status==="deployed").length} DEPLOYED
+            </div>
+            {Object.values(resources).map(r => (
+              <div key={r.id} style={{ padding:"8px 10px", borderBottom:"1px solid rgba(255,120,0,0.06)" }}>
+                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                  <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, color:RESOURCE_COLOR[r.type], display:"flex", alignItems:"center", gap:5 }}>
+                    <span>{RESOURCE_ICON[r.type]}</span><span>{r.label}</span>
                   </div>
-                  {cargoEntries.map(([cargo,inv])=>{
-                    const pct = (inv/node.capacity[cargo])*100;
-                    const bc = pct<30?"#ff3040":pct<60?"#f0a500":CARGO_COLOR[cargo];
-                    const isCritical = pct < node.criticalThreshold*100;
-                    return (
-                      <div key={cargo} style={{marginBottom:4}}>
-                        <div style={{display:"flex",justifyContent:"space-between",fontFamily:"'Share Tech Mono',monospace",fontSize:8,marginBottom:2}}>
-                          <span style={{color:CARGO_COLOR[cargo],display:"flex",alignItems:"center",gap:4}}>
-                            {isCritical&&<span style={{color:"#ff3040",fontSize:9}}>!</span>}
-                            {cargo.toUpperCase()}
-                          </span>
-                          <span style={{color:bc}}>{Math.round(inv)}/{node.capacity[cargo]}</span>
-                        </div>
-                        <div style={{height:3,background:"rgba(255,255,255,0.05)",borderRadius:1}}>
-                          <div style={{height:"100%",width:`${pct}%`,background:bc,borderRadius:1,transition:"width 0.5s",
-                            boxShadow:isCritical?`0 0 4px ${bc}`:undefined}}/>
-                        </div>
-                      </div>
-                    );
-                  })}
-                  {/* Demand indicators */}
-                  <div style={{marginTop:4,fontFamily:"'Share Tech Mono',monospace",fontSize:7,color:"rgba(255,255,255,0.18)",display:"flex",flexWrap:"wrap",gap:"2px 8px"}}>
-                    {Object.entries(node.demandPerTick).filter(([,v])=>(v as number)>0).map(([c,v])=>(
-                      <span key={c}>⬇ {c.substring(0,3).toUpperCase()} {(v as number).toFixed(1)}/t</span>
-                    ))}
-                  </div>
+                  <span style={{ fontSize:8, color:r.status==="available"?"rgba(0,200,80,0.7)":r.status==="deployed"?"rgba(255,120,0,0.7)":"rgba(255,255,255,0.2)", fontFamily:"'Share Tech Mono',monospace" }}>{r.status.toUpperCase()}</span>
                 </div>
-              );
-            })}
+                <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,255,255,0.3)", lineHeight:1.7 }}>
+                  <div>BASE: {r.baseName}</div>
+                  {r.assignedTaskId && <div style={{ color:RESOURCE_COLOR[r.type] }}>TASK: {r.assignedTaskId} → {r.assignedFips ? (counties[r.assignedFips]?.name ?? r.assignedFips) : ""}</div>}
+                  {r.notes && <div style={{ color:"rgba(255,255,255,0.2)" }}>{r.notes}</div>}
+                </div>
+              </div>
+            ))}
           </div>
         )}
 
         {/* AIP tab */}
-        {rightTab==="aip"&&(
-          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-            <div style={{padding:"8px",borderBottom:"1px solid rgba(0,200,255,0.08)"}}>
-              <div style={{fontFamily:"'Share Tech Mono',monospace",fontSize:8,color:"var(--text-dim)",marginBottom:6,lineHeight:1.6}}>
-                OPERATOR INTENT → CONSTRAINTS → LIVE REPLANNING<br/>
-                <span style={{color:"rgba(0,200,255,0.3)"}}>Try: "route all medevac by ground", "suggest ammo resupply to Delta", "explain current risk"</span>
+        {tab==="aip" && (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+            <div style={{ padding:"8px 10px", borderBottom:"1px solid rgba(255,120,0,0.08)" }}>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,120,0,0.4)", marginBottom:5, lineHeight:1.7 }}>
+                AIP OPERATIONS COPILOT<br/>
+                <span style={{ color:"rgba(255,120,0,0.25)" }}>e.g. "synthesize current situation", "recommend actions for top counties", "prioritize hospital-serving counties", "explain why Fulton ranks first"</span>
               </div>
-              <textarea className="aip-input" rows={3}
-                placeholder={"e.g. avoid threat zones\nprioritize medevac missions\nsuggest resupply for Outpost Delta"}
-                value={aipInput}
+              <textarea className="aip-input" rows={3} value={aipInput}
+                placeholder={"synthesize the current situation\nrecommend immediate actions\nprioritize coastal counties\nexplain top county ranking"}
                 onChange={e=>setAipInput(e.target.value)}
                 onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendAIP();}}}
               />
-              <button className="btn btn-primary" style={{marginTop:4}} onClick={sendAIP} disabled={aipLoading}>
-                {aipLoading?"⟳  PROCESSING...":"▶  SEND TO AIP"}
+              <button className="btn btn-primary" style={{ marginTop:4 }} onClick={sendAIP} disabled={aipLoading}>
+                {aipLoading?"⟳ PROCESSING...":"▶ SEND TO AIP"}
               </button>
-              {lastAIP&&(
-                <div style={{marginTop:8,padding:8,background:"rgba(0,8,4,0.85)",border:"1px solid rgba(0,255,136,0.1)",fontFamily:"'Share Tech Mono',monospace"}}>
-                  <div style={{color:"var(--amber)",fontSize:8,marginBottom:3,letterSpacing:"0.15em"}}>ACTION: {lastAIP.action.toUpperCase()}</div>
-                  <div style={{color:"rgba(0,255,136,0.75)",fontSize:9,lineHeight:1.6}}>{lastAIP.explanation}</div>
-                  {lastAIP.weights&&(
-                    <div style={{marginTop:4,color:"rgba(0,200,100,0.45)",fontSize:8,display:"flex",flexWrap:"wrap",gap:"3px 8px"}}>
-                      {Object.entries(lastAIP.weights).map(([k,v])=><span key={k}>{k}:{(v as number).toFixed(1)}</span>)}
+              {lastAIP && (
+                <div style={{ marginTop:8, padding:"8px 10px", background:"rgba(0,8,4,0.8)", border:"1px solid rgba(0,229,255,0.12)", fontFamily:"'Share Tech Mono',monospace" }}>
+                  <div style={{ fontSize:8, color:"var(--orange)", marginBottom:3, letterSpacing:"0.15em" }}>{lastAIP.action.replace(/_/g," ").toUpperCase()}</div>
+                  <div style={{ fontSize:9, color:"rgba(200,240,220,0.8)", lineHeight:1.7 }}>{lastAIP.message}</div>
+                  {lastAIP.weightOverrides && (
+                    <div style={{ marginTop:4, fontSize:8, color:"rgba(255,120,0,0.5)" }}>
+                      ↻ Weights updated: {Object.entries(lastAIP.weightOverrides).map(([k,v])=>`${k}=${v?.toFixed(2)}`).join(", ")}
                     </div>
                   )}
                 </div>
               )}
             </div>
-            <div className="panel-header">DECISION FEED</div>
-            <div ref={logRef} style={{flex:1,overflowY:"auto",padding:"5px 8px"}}>
-              {world.log.map((e,i)=>{
-                const m=e.msg;
-                const c=m.includes("⚠")||m.includes("🔋")?"rgba(240,165,0,0.75)":m.includes("✓")?"rgba(0,255,136,0.75)":m.includes("🚨")?"rgba(255,48,64,0.75)":m.includes("↺")||m.includes("📡")||m.includes("🎯")?"rgba(0,229,255,0.75)":"";
-                return <div key={i} className="log-line" style={{color:c||undefined}}>
-                  <span style={{color:"rgba(0,200,255,0.18)",marginRight:5}}>[{String(e.tick).padStart(3,"0")}]</span>{m}
-                </div>;
+            <div className="panel-header">ACTIVITY FEED</div>
+            <div ref={logRef} style={{ flex:1, overflowY:"auto", padding:"4px 8px" }}>
+              {[...log].reverse().map(e=>{
+                const c=e.level==="critical"?"rgba(255,32,32,0.8)":e.level==="warning"?"rgba(255,120,0,0.75)":e.level==="action"?"rgba(0,200,80,0.75)":e.level==="aip"?"rgba(0,229,255,0.7)":"rgba(255,255,255,0.2)";
+                return<div key={e.id} className="log-line" style={{color:c}}><span style={{color:"rgba(255,120,0,0.2)",marginRight:4}}>{new Date(e.timestamp).toLocaleTimeString("en",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}</span>{e.message}</div>;
               })}
             </div>
           </div>
         )}
 
-        {/* Bottom legend */}
-        <div style={{padding:"5px 8px",borderTop:"1px solid rgba(0,200,255,0.08)",fontFamily:"'Share Tech Mono',monospace",fontSize:8,color:"var(--text-dim)"}}>
-          <div style={{display:"flex",flexWrap:"wrap",gap:"3px 10px"}}>
-            <span><span style={{color:"#ff3040"}}>■</span> NO-GO</span>
-            <span><span style={{color:"#ff6600"}}>■</span> THREAT</span>
-            <span><span style={{color:"#8844ff"}}>■</span> GPS-DENY</span>
-            <span><span style={{color:"#f0a500"}}>●</span> PENDING</span>
-            <span><span style={{color:"#00e5ff"}}>●</span> QUEUED/ACTIVE</span>
-            <span><span style={{color:"#00ff88"}}>●</span> DONE</span>
+        {/* ONTOLOGY tab */}
+        {tab==="ontology" && (
+          <div style={{ flex:1, overflowY:"auto", padding:"8px 10px", fontFamily:"'Share Tech Mono',monospace" }}>
+            <div style={{ fontSize:8, color:"rgba(255,120,0,0.5)", letterSpacing:"0.2em", marginBottom:10 }}>FOUNDRY ONTOLOGY — LIVE OBJECT COUNTS</div>
+            {[
+              { obj:"CountyRegion", count:Object.keys(counties).length, color:"#f0a500", desc:"ACS demographics + risk scores" },
+              { obj:"HazardEvent", count:alerts.length, color:"#ff6600", desc:"Active NWS alerts" },
+              { obj:"FEMADeclaration", count:state.declarations.length, color:"#ff2020", desc:"Disaster declarations (5yr)" },
+              { obj:"CriticalFacility", count:state.hospitals.length, color:"#ff3040", desc:"HIFLD hospital locations" },
+              { obj:"ResponseResource", count:Object.keys(resources).length, color:"#00e5ff", desc:"Crews, generators, teams" },
+              { obj:"ResponseTask", count:Object.keys(tasks).length, color:"#ffcc00", desc:"Auto-generated from rules" },
+            ].map(row => (
+              <div key={row.obj} style={{ marginBottom:10, padding:"8px", background:"rgba(0,0,0,0.3)", border:`1px solid ${row.color}22` }}>
+                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                  <span style={{ color:row.color, fontSize:10 }}>{row.obj}</span>
+                  <span style={{ color:row.color, fontSize:12, fontWeight:700 }}>{row.count}</span>
+                </div>
+                <div style={{ fontSize:8, color:"rgba(255,255,255,0.25)" }}>{row.desc}</div>
+              </div>
+            ))}
+            <div style={{ marginTop:8, fontSize:8, color:"rgba(255,120,0,0.3)", lineHeight:1.8 }}>
+              RELATIONSHIPS:<br/>
+              HazardEvent →impacts→ CountyRegion<br/>
+              CountyRegion →contains→ CriticalFacility<br/>
+              CountyRegion →requires→ ResponseTask<br/>
+              ResponseTask →assigned_to→ ResponseResource
+            </div>
+            <div style={{ marginTop:10, fontSize:8, color:"rgba(255,120,0,0.2)" }}>
+              DATA SOURCES:<br/>
+              NWS api.weather.gov/alerts<br/>
+              OpenFEMA fema.gov/api/open<br/>
+              Census api.census.gov/data/acs5<br/>
+              HIFLD services1.arcgis.com/Hp6G80
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       {/* Bottom strip */}
-      <div style={{position:"absolute",bottom:0,left:195,right:290,fontFamily:"'Share Tech Mono',monospace",fontSize:8,color:"rgba(0,200,255,0.2)",padding:"4px 12px",letterSpacing:"0.1em",zIndex:100,textAlign:"center",pointerEvents:"none"}}>
-        WIND: {world.weather.windSpeed.toFixed(1)} kts · VIS: {(world.weather.visibility*100).toFixed(0)}% · UNCLASSIFIED // FOR DEMONSTRATION ONLY
+      <div style={{ position:"absolute", bottom:0, left:235, right:310, fontFamily:"'Share Tech Mono',monospace", fontSize:7.5, color:"rgba(255,120,0,0.2)", padding:"3px 12px", zIndex:100, textAlign:"center", pointerEvents:"none", letterSpacing:"0.1em" }}>
+        GEORGIA EMERGENCY OPERATIONS · {sortedCounties.filter(c=>c.alertLevel!=="none").length} COUNTIES UNDER ALERT · DATA: NWS · OPENFEMA · CENSUS ACS · HIFLD
       </div>
     </div>
   );
 }
 
-function HudStat({label,value,color}:{label:string;value:string;color:string}) {
+// ── Sub-components ────────────────────────────────────────────────────────────
+function CountyRow({ county, rank, isSelected, onClick }: { county:CountyData; rank:number; isSelected:boolean; onClick:()=>void }) {
+  const rc = county.riskScore>0.65?"#ff2020":county.riskScore>0.45?"#ff6600":county.riskScore>0.25?"#f0a500":county.riskScore>0.1?"#ffcc00":"#445";
   return (
-    <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:1}}>
-      <span style={{fontSize:7,color:"rgba(0,200,255,0.3)",letterSpacing:"0.18em",fontFamily:"'Share Tech Mono',monospace"}}>{label}</span>
-      <span style={{fontSize:13,color,fontFamily:"'Share Tech Mono',monospace"}}>{value}</span>
+    <div onClick={onClick} style={{ padding:"5px 8px", borderBottom:"1px solid rgba(255,120,0,0.06)", cursor:"pointer", background:isSelected?"rgba(255,120,0,0.08)":"transparent", display:"flex", alignItems:"center", gap:8 }}>
+      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,120,0,0.25)", width:18, textAlign:"right" }}>{rank}</span>
+      <div style={{ flex:1 }}>
+        <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:isSelected?"var(--orange)":"rgba(255,255,255,0.7)" }}>
+          {county.name}
+          {county.hospitals.length>0 && <span style={{ color:"rgba(255,48,48,0.6)", marginLeft:4, fontSize:8 }}>🏥{county.hospitals.length}</span>}
+          {county.hasDeclaration && <span style={{ color:"rgba(255,200,0,0.5)", marginLeft:3, fontSize:7 }}>⚡</span>}
+        </div>
+        <div style={{ height:2.5, background:"rgba(255,255,255,0.05)", borderRadius:1, marginTop:2 }}>
+          <div style={{ height:"100%", width:`${county.riskScore*100}%`, background:rc, borderRadius:1, transition:"width 0.5s" }}/>
+        </div>
+      </div>
+      <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:1 }}>
+        <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:rc }}>{(county.riskScore*100).toFixed(0)}</span>
+        {county.alertLevel!=="none"&&<span style={{ fontSize:7, color:ALERT_COLOR[county.alertLevel] }}>{county.alertLevel.toUpperCase()}</span>}
+      </div>
     </div>
   );
 }
 
-function ToggleBtn({active,onClick,label}:{active:boolean;onClick:()=>void;label:string}) {
+function TaskCard({ task, county, resource, onApprove, onCancel }: { task:ResponseTask; county?:CountyData; resource:ResponseResource|null; onApprove:()=>void; onCancel:()=>void }) {
+  const tc = TASK_COLOR[task.type]??"#888";
+  const sc = task.priorityScore>=80?"#ff2020":task.priorityScore>=60?"#ff6600":task.priorityScore>=40?"#f0a500":"#555";
+  const isPending = task.status==="pending";
+  const isDone = ["complete","cancelled"].includes(task.status);
   return (
-    <button onClick={onClick} style={{
-      fontFamily:"'Share Tech Mono',monospace",fontSize:8,letterSpacing:"0.12em",
-      padding:"3px 8px",border:"1px solid",cursor:"pointer",background:"transparent",
-      borderColor:active?"rgba(0,229,255,0.5)":"rgba(0,200,255,0.15)",
-      color:active?"#00e5ff":"rgba(0,200,255,0.3)",transition:"all 0.12s",
-    }}>{label}</button>
-  );
-}
-
-function TaskCard({task,onApprove,onCancel,srcName,dstName}:{
-  task:Task; onApprove?:()=>void; onCancel?:()=>void; srcName:string; dstName:string;
-}) {
-  const statusColor = TASK_STATUS_COLOR[task.status]??"#888";
-  const mainCargo = task.cargo[0];
-  return (
-    <div style={{padding:"8px 10px",borderBottom:"1px solid rgba(0,200,255,0.07)",fontFamily:"'Share Tech Mono',monospace"}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
-        <div style={{display:"flex",alignItems:"center",gap:6}}>
-          {mainCargo&&<span style={{fontSize:9,color:CARGO_COLOR[mainCargo.type]??'#888'}}>
-            {mainCargo.type==="medevac"?"🚑":mainCargo.type==="ammo"?"💥":mainCargo.type==="fuel"?"⛽":mainCargo.type==="food"?"🍱":"📦"}
-          </span>}
-          <span style={{fontSize:10,color:"var(--text-bright)"}}>{task.id}</span>
-          <span style={{fontSize:8,color:"rgba(255,255,255,0.25)"}}>P{task.priority}</span>
+    <div style={{ padding:"7px 10px", borderBottom:"1px solid rgba(255,120,0,0.06)", opacity:isDone?0.5:1 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:3 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+          <span style={{ fontSize:12 }}>{TASK_ICON[task.type]}</span>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:tc }}>{task.type.replace(/_/g," ").toUpperCase()}</span>
         </div>
-        <span style={{fontSize:8,color:statusColor}}>{task.status.toUpperCase()}</span>
-      </div>
-      <div style={{fontSize:8,color:"var(--text-dim)",lineHeight:1.7,marginBottom:4}}>
-        <div>{srcName} → {dstName}</div>
-        <div style={{display:"flex",gap:8}}>
-          {task.cargo.map((c,i)=>(
-            <span key={i} style={{color:CARGO_COLOR[c.type]??'#888'}}>{c.quantity}× {c.type}</span>
-          ))}
-          {task.riskScore>0&&<span style={{color:task.riskScore>0.5?"#ff6600":"rgba(255,255,255,0.2)"}}>RISK: {task.riskScore.toFixed(2)}</span>}
+        <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:9, color:sc, fontWeight:700 }}>P{task.priorityScore}</span>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:task.status==="assigned"?"rgba(0,200,80,0.7)":task.status==="pending"?"rgba(255,120,0,0.7)":"rgba(255,255,255,0.25)" }}>{task.status.toUpperCase()}</span>
         </div>
-        {task.assignedAsset&&<div style={{color:"rgba(0,229,255,0.5)"}}>ASSET: {task.assignedAsset}</div>}
       </div>
-      {(onApprove||onCancel)&&(
-        <div style={{display:"flex",gap:4}}>
-          {onApprove&&<button className="btn btn-primary" style={{fontSize:8,padding:"3px 8px",flex:1}} onClick={onApprove}>✓ APPROVE</button>}
-          {onCancel&&<button className="btn btn-alert" style={{fontSize:8,padding:"3px 8px",flex:1}} onClick={onCancel}>✗ CANCEL</button>}
+      <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,255,255,0.55)", marginBottom:2 }}>{task.targetName} County</div>
+      <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,255,255,0.25)", lineHeight:1.6 }}>
+        {task.triggerReason}
+        {resource && <div style={{ color:RESOURCE_COLOR[resource.type] }}>→ {resource.label}</div>}
+      </div>
+      {!isDone && (
+        <div style={{ display:"flex", gap:4, marginTop:5 }}>
+          {isPending && <button onClick={onApprove} style={{ flex:1, padding:"3px", background:"rgba(0,180,60,0.08)", border:"1px solid rgba(0,180,60,0.3)", color:"rgba(0,200,80,0.8)", fontFamily:"'Share Tech Mono',monospace", fontSize:8, cursor:"pointer" }}>▶ ACTIVATE</button>}
+          <button onClick={onCancel} style={{ flex:1, padding:"3px", background:"transparent", border:"1px solid rgba(255,50,50,0.2)", color:"rgba(255,50,50,0.4)", fontFamily:"'Share Tech Mono',monospace", fontSize:8, cursor:"pointer" }}>✗ CANCEL</button>
         </div>
       )}
+    </div>
+  );
+}
+
+function HudStat({ label, value, color }: { label:string; value:string; color:string }) {
+  return (
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:1 }}>
+      <span style={{ fontSize:7, color:"rgba(255,120,0,0.3)", letterSpacing:"0.18em", fontFamily:"'Share Tech Mono',monospace" }}>{label}</span>
+      <span style={{ fontSize:12, color, fontFamily:"'Share Tech Mono',monospace" }}>{value}</span>
+    </div>
+  );
+}
+
+function DataPill({ label, ts, warn }: { label:string; ts:string|null; warn?:boolean }) {
+  const age = ts ? Math.round((Date.now()-new Date(ts).getTime())/60000) : null;
+  return (
+    <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, display:"flex", alignItems:"center", gap:3 }}>
+      <span style={{ color: warn?"rgba(255,50,50,0.5)":age&&age<5?"rgba(0,200,80,0.6)":"rgba(255,120,0,0.4)" }}>●</span>
+      <span style={{ color:"rgba(255,255,255,0.25)" }}>{label}</span>
+      {age!==null && <span style={{ color:"rgba(255,120,0,0.25)" }}>{age}m</span>}
+    </div>
+  );
+}
+
+function DataRow({ label, value, warn, color }: { label:string; value:string; warn?:boolean; color?:string }) {
+  return (
+    <div style={{ display:"flex", justifyContent:"space-between", padding:"2px 0", borderBottom:"1px solid rgba(255,120,0,0.04)" }}>
+      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:"rgba(255,255,255,0.25)" }}>{label}</span>
+      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:8, color:color||(warn?"#ff6600":"rgba(255,255,255,0.55)") }}>{value}</span>
     </div>
   );
 }
